@@ -1,0 +1,19 @@
+{
+  "mcpServers": {
+    "mssql": {
+      "command": "D:\\WorkSpace\\mcp_servers\\mcp_mssql\\.venv\\Scripts\\mssql-mcp-server.exe",
+      "args": [],
+      "env": {
+        "MSSQL_AUTH_MODE": "entra_interactive",
+        "MSSQL_READ_ONLY": "true",
+        "MSSQL_MAX_ROWS": "1000",
+        "MSSQL_QUERY_TIMEOUT": "30",
+        "MSSQL_ENVIRONMENTS_FILE": "D:\\WorkSpace\\mcp_servers\\mcp_mssql\\environments.json",
+        "MSSQL_AUDIT_LOG_PATH": "D:\\WorkSpace\\mcp_servers\\mcp_mssql\\logs\\audit.jsonl",
+        "MSSQL_TOKEN_CACHE_PATH": "C:\\Users\\<you>\\.cache\\mssql-mcp\\token-cache.bin",
+        "MCP_TRANSPORT": "stdio",
+        "LOG_LEVEL": "INFO"
+      }
+    }
+  }
+}

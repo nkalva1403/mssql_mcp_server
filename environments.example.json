@@ -1,0 +1,26 @@
+{
+  "default": "dev",
+  "environments": [
+    {
+      "name": "dev",
+      "description": "Dev managed instance",
+      "server": "your-dev-mssql.<dns-zone>.database.windows.net",
+      "port": 1433,
+      "default_database": "master"
+    },
+    {
+      "name": "qa",
+      "description": "QA managed instance",
+      "server": "your-qa-mssql.<dns-zone>.database.windows.net",
+      "port": 1433,
+      "default_database": "master"
+    },
+    {
+      "name": "prod",
+      "description": "Production MI - keep MSSQL_READ_ONLY=true",
+      "server": "your-prod-mssql.<dns-zone>.database.windows.net",
+      "port": 1433,
+      "default_database": "master"
+    }
+  ]
+}
