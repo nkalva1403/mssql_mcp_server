@@ -246,11 +246,41 @@ indexes by name. Claude will pick the right tool automatically.
 | `list_environments`, `current_environment`, `switch_environment`, `switch_database` | Navigate between configured SQL Server targets |
 | `list_databases`, `list_schemas`, `list_tables`, `describe_table` | Schema introspection |
 | `list_indexes`, `list_foreign_keys` | Per-table metadata |
-| `execute_query` | Read-only SELECT / CTE, row-capped |
+| `list_procedures`, `list_functions`, `list_views`, `get_object_definition` | Programmable-object inspection (source from `sys.sql_modules`) |
+| `compare_procedure`, `compare_function`, `compare_view`, `compare_table` | Cross-environment diff — registry mode only |
+| `execute_query` | Read-only SELECT / CTE, row-capped. Accepts `format="compact"` for columnar rows (~40-60% smaller payload) |
 | `execute_non_query` | INSERT / UPDATE / DELETE / MERGE — registered only when `MSSQL_READ_ONLY=false` |
 | `execute_ddl` | CREATE / ALTER / DROP / TRUNCATE — needs `READ_ONLY=false` **and** `ALLOW_DDL=true` |
 | `explain_query` | Estimated plan (no execution) |
 | `server_info` | Version, DB, user, `ORIGINAL_LOGIN()`, active MCP mode, active auth mode |
+
+### Cross-environment comparison
+
+In registry mode, the `compare_*` tools read from two configured
+environments in a single call without a `switch_environment`. The
+manager keeps one connection pool per environment alive on demand, so
+asking `compare_procedure("dev", "prod", "dbo", "usp_billing")` opens
+both servers concurrently and returns a unified diff. Examples:
+
+> *"Compare `dbo.usp_billing` between dev and qa."* — runs
+> `compare_procedure(env_a="dev", env_b="qa", schema="dbo", name="usp_billing")`,
+> returns a unified diff plus `a_line_count` / `b_line_count` /
+> `a_missing` / `b_missing` flags.
+>
+> *"Has the `Users` table schema drifted between qa and prod?"* — runs
+> `compare_table`, returns column / index / foreign-key diffs (each
+> entry tagged `added` / `removed` / `changed`, identical fields
+> omitted).
+
+### Compact response format
+
+`execute_query` accepts an optional `format` argument:
+
+- `"dict"` (default): rows are `[{col: value, ...}, ...]` — human-friendly.
+- `"compact"`: rows are `[[value, value, ...], ...]` aligned to
+  `columns`. On a 100-row × 10-column result this typically halves the
+  JSON payload, which matters for token-bound AI usage. Identical
+  semantics — just no repeated column names per row.
 
 ---
 
@@ -401,16 +431,23 @@ mssql-mcp-server/
 ├── pyproject.toml
 ├── src/mssql_mcp/
 │   ├── server.py                  # FastMCP wiring
-│   ├── manager.py                 # runtime env switching
+│   ├── manager.py                 # runtime env switching + multi-env pool cache
 │   ├── environments.py            # registry model + loader
 │   ├── config.py                  # Settings (pydantic-settings)
 │   ├── auth.py                    # TokenProvider (Entra)
 │   ├── db.py                      # classifier + token-aware pool
 │   ├── audit.py                   # JSONL logger
 │   ├── cli.py                     # init / doctor / serve subcommands
-│   ├── models.py                  # Pydantic input/output
-│   └── tools/                     # one file per tool group
-└── tests/                         # 146 tests; 129 unit + 17 integration
+│   ├── models.py                  # Pydantic input/output (incl. compact + diff)
+│   └── tools/
+│       ├── query.py               # execute_query / execute_non_query / execute_ddl
+│       ├── schema.py              # list_databases / list_schemas / list_tables / describe_table
+│       ├── indexes.py             # list_indexes / list_foreign_keys
+│       ├── objects.py             # list_procedures / list_functions / list_views / get_object_definition
+│       ├── compare.py             # compare_procedure / compare_function / compare_view / compare_table
+│       ├── diagnostics.py         # explain_query / server_info
+│       └── environments.py        # list_environments / current_environment / switch_*
+└── tests/                         # 169 tests; 152 unit + 17 integration
 ```
 
 ### Single-server vs registry mode

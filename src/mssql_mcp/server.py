@@ -7,9 +7,10 @@ mode at startup so operators can see at a glance which connection flow
 is in use.
 
 When :attr:`Settings.mssql_environments_file` is set, the server runs
-in *registry mode* — multiple named environments are available and tools
-operate against whichever one is currently active. Otherwise it runs in
-single-server mode for backward compatibility."""
+in *registry mode* — multiple named environments are available, tools
+operate against whichever one is currently active, and cross-env compare
+tools can read from two environments in the same call without a switch.
+Otherwise it runs in single-server mode for backward compatibility."""
 
 from __future__ import annotations
 
@@ -22,21 +23,30 @@ from mssql_mcp.config import Settings, get_settings
 from mssql_mcp.environments import EnvironmentRegistry
 from mssql_mcp.manager import DatabaseManager
 from mssql_mcp.models import (
+    CompactQueryResult,
     CurrentEnvironment,
     DdlResult,
     EnvironmentInfo,
     ForeignKeyInfo,
     IndexInfo,
     NonQueryResult,
+    ObjectDefinition,
+    ObjectDiff,
+    ObjectInfo,
+    ObjectKind,
     QueryParam,
     QueryResult,
+    ResponseFormat,
     ServerInfo,
     TableDescription,
+    TableDiff,
     TableInfo,
 )
+from mssql_mcp.tools import compare as compare_tools
 from mssql_mcp.tools import diagnostics as diagnostics_tools
 from mssql_mcp.tools import environments as env_tools
 from mssql_mcp.tools import indexes as indexes_tools
+from mssql_mcp.tools import objects as objects_tools
 from mssql_mcp.tools import query as query_tools
 from mssql_mcp.tools import schema as schema_tools
 
@@ -66,7 +76,11 @@ def build_server(settings: Settings) -> tuple[FastMCP, DatabaseManager]:
             "string-interpolated values. If multiple environments are "
             "configured, call `list_environments` and `current_environment` "
             "before assuming which server you're talking to; use "
-            "`switch_environment` / `switch_database` to move."
+            "`switch_environment` / `switch_database` to move. To compare "
+            "objects across servers without switching, use the `compare_*` "
+            "tools (procedure/function/view/table). For wide or many-row "
+            "result sets, pass `format='compact'` to `execute_query` to "
+            "halve the token cost."
         ),
         host=settings.mcp_http_host,
         port=settings.mcp_http_port,
@@ -79,7 +93,7 @@ def build_server(settings: Settings) -> tuple[FastMCP, DatabaseManager]:
     def list_environments() -> list[EnvironmentInfo]:
         """List every configured SQL Server environment (name, server,
         port, default database). Use ``switch_environment`` to make one
-        of them active."""
+        of them active, or pass the name to a ``compare_*`` tool."""
         return env_tools.list_environments(manager)
 
     @mcp.tool()
@@ -156,21 +170,145 @@ def build_server(settings: Settings) -> tuple[FastMCP, DatabaseManager]:
             manager.current_db, schema=schema, table=table
         )
 
+    # ----- programmable-object inspection (always on) ----------------------
+
+    @mcp.tool()
+    def list_procedures(
+        schema: str | None = None, name_pattern: str | None = None
+    ) -> list[ObjectInfo]:
+        """List user stored procedures (excludes Microsoft-shipped).
+        ``name_pattern`` is a SQL ``LIKE`` pattern."""
+        return objects_tools.list_procedures(
+            manager.current_db, schema=schema, name_pattern=name_pattern
+        )
+
+    @mcp.tool()
+    def list_functions(
+        schema: str | None = None,
+        name_pattern: str | None = None,
+        kind: ObjectKind | None = None,
+    ) -> list[ObjectInfo]:
+        """List user functions. ``kind`` narrows to ``scalar_function``
+        or ``table_function``; omit to get both."""
+        return objects_tools.list_functions(
+            manager.current_db, schema=schema, name_pattern=name_pattern, kind=kind
+        )
+
+    @mcp.tool()
+    def list_views(
+        schema: str | None = None, name_pattern: str | None = None
+    ) -> list[ObjectInfo]:
+        """List user views (excludes Microsoft-shipped)."""
+        return objects_tools.list_views(
+            manager.current_db, schema=schema, name_pattern=name_pattern
+        )
+
+    @mcp.tool()
+    def get_object_definition(
+        schema: str, name: str
+    ) -> ObjectDefinition | None:
+        """Return the CREATE source for a procedure / function / view
+        from ``sys.sql_modules``. Returns ``null`` if not found."""
+        return objects_tools.get_object_definition(
+            manager.current_db, schema=schema, name=name
+        )
+
+    # ----- cross-environment compare (registry mode only) ------------------
+
+    if registry is not None:
+
+        @mcp.tool()
+        def compare_procedure(
+            env_a: str,
+            env_b: str,
+            schema: str,
+            name: str,
+            database_a: str | None = None,
+            database_b: str | None = None,
+        ) -> ObjectDiff:
+            """Unified diff of one stored procedure across two
+            environments. ``env_a`` / ``env_b`` are environment names
+            from ``list_environments``. Optional ``database_a`` /
+            ``database_b`` override each env's default database."""
+            return compare_tools.compare_procedure(
+                manager, env_a, env_b, schema, name,
+                database_a=database_a, database_b=database_b,
+            )
+
+        @mcp.tool()
+        def compare_function(
+            env_a: str,
+            env_b: str,
+            schema: str,
+            name: str,
+            database_a: str | None = None,
+            database_b: str | None = None,
+        ) -> ObjectDiff:
+            """Unified diff of one user function (scalar or TVF) across
+            two environments."""
+            return compare_tools.compare_function(
+                manager, env_a, env_b, schema, name,
+                database_a=database_a, database_b=database_b,
+            )
+
+        @mcp.tool()
+        def compare_view(
+            env_a: str,
+            env_b: str,
+            schema: str,
+            name: str,
+            database_a: str | None = None,
+            database_b: str | None = None,
+        ) -> ObjectDiff:
+            """Unified diff of one view's definition across two envs."""
+            return compare_tools.compare_view(
+                manager, env_a, env_b, schema, name,
+                database_a=database_a, database_b=database_b,
+            )
+
+        @mcp.tool()
+        def compare_table(
+            env_a: str,
+            env_b: str,
+            schema: str,
+            table: str,
+            database_a: str | None = None,
+            database_b: str | None = None,
+        ) -> TableDiff:
+            """Structural diff of one table across two environments:
+            columns (type / nullability / identity / default), indexes
+            (key + included columns, filter), and foreign keys. Only
+            differences are listed."""
+            return compare_tools.compare_table(
+                manager, env_a, env_b, schema, table,
+                database_a=database_a, database_b=database_b,
+            )
+
     # ----- query execution -------------------------------------------------
 
     @mcp.tool()
     def execute_query(
-        sql: str, params: list[QueryParam] | None = None
-    ) -> QueryResult:
+        sql: str,
+        params: list[QueryParam] | None = None,
+        format: ResponseFormat = "dict",
+    ) -> QueryResult | CompactQueryResult:
         """Run a read-only T-SQL statement (SELECT or CTE-led SELECT).
 
-        Prefer parameterised queries: pass each value as a
-        ``QueryParam`` and use ``?`` placeholders in the SQL. Inlining
-        values into the SQL is allowed but discouraged.
+        Prefer parameterised queries: pass each value as a ``QueryParam``
+        and use ``?`` placeholders in the SQL. Inlining values into the
+        SQL is allowed but discouraged.
+
+        ``format='compact'`` returns columnar rows
+        (``rows: list[list]``) instead of list-of-dicts — saves ~40-60%
+        of tokens on wide or many-row results. Use it whenever you just
+        need to read data; use the default ``'dict'`` when you need to
+        return to a human.
 
         Results are capped at ``MAX_ROWS`` rows; when the cap is hit
         ``truncated`` is set to True."""
-        return query_tools.execute_query(manager.current_db, sql, params)
+        return query_tools.execute_query(
+            manager.current_db, sql, params, format=format
+        )
 
     # ----- diagnostics -----------------------------------------------------
 

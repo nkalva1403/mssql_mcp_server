@@ -1,5 +1,7 @@
 """Routing layer that lets a single MCP server pivot between named
-environments (and the database within an environment) at runtime.
+environments (and the database within an environment) at runtime, **and**
+hold multiple environments live at once so cross-server comparison tools
+can read from two servers without a context switch.
 
 Why a manager instead of just one Database:
 
@@ -7,8 +9,11 @@ Why a manager instead of just one Database:
   the function object). They can't rebind to a fresh ``Database``.
 * Closures over ``manager.current_db`` always see the active connection
   pool, so switching is a single attribute change.
-* The manager is the single place that closes the previous pool when
-  the user switches — no leaks."""
+* The manager owns a *cache* of Database pools keyed by
+  ``(env_name, database)``. Single-env tools keep using ``current_db``;
+  cross-env tools call ``db_for(env_name, database=None)`` and get a
+  cached or freshly-built pool. Nothing is closed on switch — close
+  happens only at shutdown via :meth:`close_all`."""
 
 from __future__ import annotations
 
@@ -26,18 +31,24 @@ class NoEnvironmentSelectedError(RuntimeError):
     """Raised when a tool is called before any environment is active."""
 
 
+PoolKey = tuple[str, str]  # (env_name, database_name)
+
+
 class DatabaseManager:
-    """Holds the currently-active :class:`Database` and the registry of
-    environments it can be swapped to.
+    """Holds the currently-active :class:`Database` and a cache of pools
+    for every environment that's been touched in this process.
 
     Two operating modes:
 
     * **Legacy / single-server** — ``registry`` is ``None``. Settings carry
       ``mssql_server`` + ``mssql_database`` and the manager builds one
-      Database eagerly. ``switch_environment`` and friends are no-ops.
+      Database eagerly. ``switch_environment`` and ``db_for`` are no-ops
+      / not meaningful.
     * **Registry mode** — ``registry`` is provided. The manager builds
       a Database lazily when the first env is activated (either the
-      registry's ``default`` or via ``switch_environment``)."""
+      registry's ``default`` or via ``switch_environment``). Subsequent
+      ``db_for`` calls cache one Database per ``(env_name, database)``
+      tuple so compare tools can stream from two servers concurrently."""
 
     def __init__(
         self,
@@ -49,6 +60,7 @@ class DatabaseManager:
         self._db: Database | None = None
         self._env_name: str | None = None
         self._database_name: str | None = None
+        self._pools: dict[PoolKey, Database] = {}
         self._lock = Lock()
 
         if registry is None:
@@ -85,6 +97,44 @@ class DatabaseManager:
         return self.registry.get(self._env_name)
 
     # ------------------------------------------------------------------
+    # multi-env access
+
+    def db_for(
+        self, env_name: str, database: str | None = None
+    ) -> Database:
+        """Return a Database for ``env_name`` (and optionally a specific
+        ``database`` within it), building and caching one if needed.
+
+        Used by cross-environment tools (e.g. ``compare_procedure``) so
+        two servers can be queried in the same call without a switch."""
+        if self.registry is None:
+            raise RuntimeError(
+                "db_for requires registry mode — set MSSQL_ENVIRONMENTS_FILE"
+            )
+        env = self.registry.get(env_name)
+        target_db = database or env.default_database
+        if not target_db:
+            raise ValueError(
+                f"Environment {env_name!r} has no default_database; "
+                "pass an explicit database name."
+            )
+        key: PoolKey = (env_name, target_db)
+        with self._lock:
+            cached = self._pools.get(key)
+            if cached is not None:
+                return cached
+            new_settings = self.settings.model_copy(
+                update={
+                    "mssql_server": env.server,
+                    "mssql_port": env.port,
+                    "mssql_database": target_db,
+                }
+            )
+            db = Database(new_settings)
+            self._pools[key] = db
+            return db
+
+    # ------------------------------------------------------------------
     # mutators
 
     def switch_environment(
@@ -92,35 +142,22 @@ class DatabaseManager:
     ) -> None:
         """Activate environment ``name`` (and optionally a specific database).
 
-        Closes the previous pool. Raises ``KeyError`` if ``name`` isn't
-        in the registry."""
+        Cached pools for *other* environments are left alive — cross-env
+        compare tools may still be using them. Raises ``KeyError`` if
+        ``name`` isn't in the registry."""
         if self.registry is None:
             raise RuntimeError(
                 "No environments registry configured — server was started "
                 "in single-server mode. Set MSSQL_ENVIRONMENTS_FILE."
             )
+        db = self.db_for(name, database=database)
         env = self.registry.get(name)
         target_db = database or env.default_database
-        if not target_db:
-            raise ValueError(
-                f"Environment {name!r} has no default_database; "
-                "pass an explicit database name to switch_environment."
-            )
-        # Build a fresh Settings with this env's server/db spliced in.
-        new_settings = self.settings.model_copy(
-            update={
-                "mssql_server": env.server,
-                "mssql_port": env.port,
-                "mssql_database": target_db,
-            }
-        )
+        assert target_db is not None  # narrowed by db_for
         with self._lock:
-            old = self._db
-            self._db = Database(new_settings)
+            self._db = db
             self._env_name = name
             self._database_name = target_db
-            if old is not None:
-                old.close_all()
         _LOG.info(
             "Active environment: %s (server=%s, database=%s)",
             name,
@@ -136,5 +173,18 @@ class DatabaseManager:
             )
         self.switch_environment(self._env_name, database)
 
+    # ------------------------------------------------------------------
+    # cleanup
 
-__all__ = ["DatabaseManager", "NoEnvironmentSelectedError"]
+    def close_all(self) -> None:
+        """Close every cached pool (and the legacy single-server pool)."""
+        with self._lock:
+            for db in self._pools.values():
+                db.close_all()
+            self._pools.clear()
+            if self._db is not None and self.registry is None:
+                # Legacy mode: _db is owned directly, not via _pools.
+                self._db.close_all()
+
+
+__all__ = ["DatabaseManager", "NoEnvironmentSelectedError", "PoolKey"]

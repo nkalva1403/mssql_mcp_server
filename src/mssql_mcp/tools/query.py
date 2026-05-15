@@ -17,10 +17,12 @@ from mssql_mcp.db import (
     classify,
 )
 from mssql_mcp.models import (
+    CompactQueryResult,
     DdlResult,
     NonQueryResult,
     QueryParam,
     QueryResult,
+    ResponseFormat,
     to_param_tuple,
 )
 
@@ -29,12 +31,13 @@ def execute_query(
     db: Database,
     sql: str,
     params: list[QueryParam] | None = None,
-) -> QueryResult:
-    """Execute a read-only T-SQL statement (SELECT or CTE-led SELECT) and
-    return up to ``MSSQL_MAX_ROWS`` rows.
+    format: ResponseFormat = "dict",
+) -> QueryResult | CompactQueryResult:
+    """Execute a read-only T-SQL statement and return up to
+    ``MSSQL_MAX_ROWS`` rows.
 
-    Always prefer parameterised queries: pass values via ``params`` with
-    ``?`` placeholders in the SQL, never by string interpolation."""
+    ``format='compact'`` returns columnar rows (``list[list]``) instead of
+    list-of-dicts — typically 40-60% smaller on wide / many-row results."""
     bound = to_param_tuple(params)
     try:
         result = db.fetch(sql, bound)
@@ -58,6 +61,16 @@ def execute_query(
         row_cap_hit=result.truncated,
         success=True,
     )
+    if format == "compact":
+        cols = result.columns
+        compact_rows = [[row.get(c) for c in cols] for row in result.rows]
+        return CompactQueryResult(
+            columns=cols,
+            rows=compact_rows,
+            row_count=len(compact_rows),
+            truncated=result.truncated,
+            duration_ms=result.duration_ms,
+        )
     return QueryResult(
         columns=result.columns,
         rows=result.rows,
