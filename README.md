@@ -239,76 +239,210 @@ In a Claude Code chat:
 You can refer to environments, databases, schemas, tables, columns, and
 indexes by name. Claude will pick the right tool automatically.
 
-### Tools available
+### Features
 
-| Tool | What it does |
-|---|---|
-| `list_environments`, `current_environment`, `switch_environment`, `switch_database` | Navigate between configured SQL Server targets |
-| `list_databases`, `list_schemas`, `list_tables`, `describe_table` | Schema introspection |
-| `list_indexes`, `list_foreign_keys` | Per-table metadata |
-| `list_procedures`, `list_functions`, `list_views`, `get_object_definition` | Programmable-object inspection (source from `sys.sql_modules`) |
-| `compare_procedure`, `compare_function`, `compare_view`, `compare_table` | Cross-environment diff — registry mode only |
-| `execute_query` | Read-only SELECT / CTE, row-capped. Accepts `format="compact"` for columnar rows (~40-60% smaller payload) |
-| `execute_non_query` | INSERT / UPDATE / DELETE / MERGE — registered only when `MSSQL_READ_ONLY=false` |
-| `execute_ddl` | CREATE / ALTER / DROP / TRUNCATE — needs `READ_ONLY=false` **and** `ALLOW_DDL=true` |
-| `explain_query` | Estimated plan (no execution) |
-| `server_info` | Version, DB, user, `ORIGINAL_LOGIN()`, active MCP mode, active auth mode |
+Every feature below is registered conditionally on `MSSQL_READ_ONLY` and
+`MSSQL_ALLOW_DDL` at startup. The MCP server returns Pydantic-typed
+responses (see [`src/mssql_mcp/models.py`](src/mssql_mcp/models.py)) so
+Claude gets structured output, not free-form strings. Optional
+parameters are shown with `?`.
 
-### Cross-environment comparison
+#### Environment management (always on)
 
-In registry mode, the `compare_*` tools read from two configured
-environments in a single call without a `switch_environment`. The
-manager keeps one connection pool per environment alive on demand, so
-asking `compare_procedure("dev", "prod", "dbo", "usp_billing")` opens
-both servers concurrently and returns a unified diff. Examples:
+Synthesises a single `"default"` entry in single-server mode; lists the
+full registry in `environments.json` mode.
 
-> *"Compare `dbo.usp_billing` between dev and qa."* — runs
-> `compare_procedure(env_a="dev", env_b="qa", schema="dbo", name="usp_billing")`,
-> returns a unified diff plus `a_line_count` / `b_line_count` /
-> `a_missing` / `b_missing` flags.
->
-> *"Has the `Users` table schema drifted between qa and prod?"* — runs
-> `compare_table`, returns column / index / foreign-key diffs (each
-> entry tagged `added` / `removed` / `changed`, identical fields
-> omitted).
+##### `list_environments() → [EnvironmentInfo]`
+Every configured target: `name`, `description`, `server`, `port`, `default_database`.
+> *"What mssql environments are configured?"*
 
-### Release-file drift compare
+##### `current_environment() → CurrentEnvironment`
+The env + database the server is currently connected to. Call this first
+if multiple environments exist.
+> *"Which mssql am I connected to right now?"*
 
-The `compare_*` MCP tools above work environment-to-environment. For
-the common case of comparing a **consolidated release SQL file** (the
-"desired state") against a live environment (the "current state"),
-the repo ships:
+##### `switch_environment(name, database?) → CurrentEnvironment`
+Pivot to a different env. `database` overrides that env's default.
+> *"Switch to prod."*
+> *"Switch to qa and use AppDb_Snapshot."*
+
+##### `switch_database(database) → CurrentEnvironment`
+Switch DB inside the **current** env (no server change). Use
+`switch_environment` first if you need a different server.
+> *"Switch to tempdb."*
+
+#### Schema introspection (always on)
+
+##### `list_databases() → [string]`
+User databases on the connected server. Excludes `master`, `tempdb`, `model`, `msdb`.
+> *"Show me the databases."*
+
+##### `list_schemas(database?) → [string]`
+Schemas in the current DB (or a named DB).
+
+##### `list_tables(schema?, name_pattern?) → [TableInfo]`
+Tables + views. `name_pattern` is a SQL `LIKE` pattern. Row counts are
+estimates from `sys.dm_db_partition_stats` and may lag actual `COUNT(*)`.
+> *"List tables in dbo whose name starts with `QB_`."* → `list_tables(schema="dbo", name_pattern="QB_%")`
+
+##### `describe_table(schema, table) → TableDescription`
+Columns (type, nullability, identity, default), primary key, and a
+ready-to-run sample `SELECT`.
+> *"Describe `dbo.QB_QBANKS`."*
+
+##### `list_indexes(schema, table) → [IndexInfo]`
+Key columns, included columns, filter definition, and (when the DMV is
+granted) fragmentation percentage.
+> *"What indexes are on `dbo.Orders`?"*
+
+##### `list_foreign_keys(schema, table) → [ForeignKeyInfo]`
+FKs in **both directions** — outgoing FKs declared on the table plus
+incoming FKs declared on other tables that reference it.
+> *"Show all FK relationships touching `dbo.Customers`."*
+
+#### Programmable-object inspection (always on)
+
+##### `list_procedures(schema?, name_pattern?) → [ObjectInfo]`
+User stored procedures (Microsoft-shipped excluded).
+
+##### `list_functions(schema?, name_pattern?, kind?) → [ObjectInfo]`
+User functions. `kind` narrows to `"scalar_function"` or `"table_function"`
+— omit for both.
+
+##### `list_views(schema?, name_pattern?) → [ObjectInfo]`
+User views (Microsoft-shipped excluded).
+
+##### `get_object_definition(schema, name) → ObjectDefinition?`
+`CREATE` source for a procedure / function / view from
+`sys.sql_modules`. Returns `null` if not found.
+> *"Show the source of `dbo.usp_billing`."*
+
+#### Cross-environment compare (registry mode only)
+
+These read from **two** environments in a single call — no
+`switch_environment` between them. The manager keeps one connection
+pool per env alive on demand, so repeated `compare_*` calls hitting the
+same envs reuse the existing connections.
+
+##### `compare_procedure(env_a, env_b, schema, name, database_a?, database_b?) → ObjectDiff`
+Unified diff of one stored procedure across two envs, plus
+`a_line_count` / `b_line_count` / `a_missing` / `b_missing` flags.
+> *"Compare `dbo.usp_billing` between dev and qa."*
+
+##### `compare_function(env_a, env_b, schema, name, database_a?, database_b?) → ObjectDiff`
+Same for user functions (scalar or TVF).
+
+##### `compare_view(env_a, env_b, schema, name, database_a?, database_b?) → ObjectDiff`
+Same for views.
+
+##### `compare_table(env_a, env_b, schema, table, database_a?, database_b?) → TableDiff`
+Structural compare: columns (type / nullability / identity / default),
+indexes (key + included columns, filter), foreign keys. Only differences
+are listed — each entry tagged `added` / `removed` / `changed`.
+> *"Has `dbo.Users` schema drifted between qa and prod?"*
+
+#### Query execution
+
+##### `execute_query(sql, params?, format?) → QueryResult | CompactQueryResult`
+Read-only T-SQL — `SELECT` or CTE-led `SELECT`. The statement classifier
+blocks multi-statement batches, `EXEC`, `OPENROWSET`, `BACKUP`,
+`xp_cmdshell`, etc. before pyodbc sees the SQL.
+
+Always prefer parameterised queries — use `?` placeholders, pass each
+value as a `QueryParam`. Inlining values is allowed but discouraged.
+
+`format`:
+- `"dict"` *(default)* — rows as `[{col: value, ...}, ...]`, human-friendly.
+- `"compact"` — rows as `[[value, value, ...], ...]` aligned to `columns`.
+  Saves ~40–60% of tokens on wide or many-row results — semantics
+  identical, just no repeated column names per row.
+
+Capped at `MSSQL_MAX_ROWS` (default 1000); `truncated: true` when the
+cap is hit.
+
+```json
+execute_query(
+  sql="SELECT TOP 50 * FROM dbo.Orders WHERE Status = ? AND Total > ?",
+  params=[{"value": "Pending"}, {"value": 500.00}],
+  format="compact"
+)
+```
+
+> *"Run `SELECT TOP 50 * FROM dbo.Orders WHERE Status='Pending'` and return it compact."*
+
+##### `explain_query(sql) → {plan_xml, summary}`
+Estimated execution plan via `SET SHOWPLAN_XML ON`. No execution.
+> *"Explain `SELECT * FROM dbo.bigtable WHERE id = 1`."*
+
+##### `server_info() → ServerInfo`
+SQL Server version, current database / user, `ORIGINAL_LOGIN()`,
+**active MCP mode** (`read_only` / `write` / `ddl`), **active auth mode**.
+> *"What server are we on and what mode is the MCP in?"*
+
+#### Write operations (only when `MSSQL_READ_ONLY=false`)
+
+##### `execute_non_query(sql, params?) → NonQueryResult`
+`INSERT` / `UPDATE` / `DELETE` / `MERGE`. Wrapped in an explicit
+transaction. If the statement would affect more than
+`MSSQL_MAX_AFFECTED_ROWS` (default 10 000), the change is **rolled back**
+before commit.
+
+```json
+execute_non_query(
+  sql="UPDATE dbo.Users SET Status = ? WHERE Id = ?",
+  params=[{"value": "Active"}, {"value": 5611275}]
+)
+```
+
+#### DDL (only when `MSSQL_READ_ONLY=false` **and** `MSSQL_ALLOW_DDL=true`)
+
+##### `execute_ddl(sql) → DdlResult`
+Single `CREATE` / `ALTER` / `DROP` / `TRUNCATE` statement. Audited at
+`WARNING` level so DDL events stand out in the audit log.
+
+#### CLI subcommands (host process, not MCP tools)
+
+| Command | Purpose |
+|---------|---------|
+| `mssql-mcp-server serve` | Default. Run the MCP server on the configured transport (`stdio` or `http`). |
+| `mssql-mcp-server init [--env-path PATH]` | Interactive wizard: detects ODBC drivers, asks 3–4 questions, writes a starter `.env`, prints the Claude Desktop config block ready to paste. |
+| `mssql-mcp-server doctor [--skip-token] [--skip-db]` | Preflight: Python → ODBC → config → audit log → Entra token → real connection → `SELECT 1`. PASS / WARN / FAIL / INFO with one-line `fix:` hints. Exit 0 on all PASS, 1 on any FAIL — scriptable in CI. |
+| `mssql-mcp-server --version` | Print the installed version. |
+
+### Release-file drift compare (skill + script)
+
+For comparing a **consolidated release SQL file** (the desired state)
+against a live environment (the current state) — the common use case
+when reviewing a release — this repo ships a Claude Code skill plus a
+standalone CLI:
 
 | Asset | Purpose |
 |---|---|
-| `scripts/compare_release/compare.py` | Standalone read-only CLI: parses the file, ingests a staging-definition dump, and writes a clickable HTML drift report with the actual added / removed / changed SQL text per object. |
-| `.claude/skills/sql-compare/SKILL.md` | Claude Code skill — say *"compare X.sql with stg"* (or just *"compare"* with a file path in context) and Claude drives the whole workflow end-to-end. |
+| [`.claude/skills/sql-compare/SKILL.md`](.claude/skills/sql-compare/SKILL.md) | Skill that fires on *"compare X.sql with stg"* / *"drift"* / *"/sql-compare"* and drives the whole workflow end-to-end. Strictly read-only. Token-efficient: all bodies and diffs go to disk; only a small summary enters the conversation. |
+| [`scripts/compare_release/compare.py`](scripts/compare_release/compare.py) | The CLI the skill invokes. Parses the file, ingests a `sys.sql_modules` dump produced by `execute_query`, normalises both sides (strips comments / brackets / whitespace, one keyword per line), and produces a clickable HTML drift report. |
 
-What you get on disk:
+Trigger phrases the skill recognises: *"compare"*, *"compare X.sql with stg"*,
+*"drift"*, *"release diff"*, *"what would deploy"*, *"check if file matches DB"*.
+
+What lands on disk:
 
 ```
 build/drift/<timestamp>/
-├── index.html              ← summary table, click any DRIFT row
-├── <OBJECT>.html           ← per-object change blocks (real SQL + context)
-├── <OBJECT>.txt            ← plain-text equivalent (grep-friendly)
-└── report.json             ← machine-readable summary
+├── index.html         ← summary table, click any DRIFT row
+├── <OBJECT>.html      ← per-object change blocks: added / only-in-staging / changed,
+│                        with surrounding identical-on-both-sides context
+├── <OBJECT>.txt       ← plain-text equivalent (grep-friendly)
+└── report.json        ← machine-readable summary + per-object change counts
 ```
 
-The skill enforces hard rules: never DDL/DML, only objects in the file
-are reported, and chat output is kept to one screen — diffs go to disk,
-not into your context window. See
-[`scripts/compare_release/README.md`](scripts/compare_release/README.md)
-for the manual invocation.
+Statuses surfaced: `MATCH` / `DRIFT` / **`staging ahead`** (heuristic
+from audit-history dates: staging has dates the file doesn't — the file
+would regress those changes) / `missing` (object in file, not on the
+target).
 
-### Compact response format
-
-`execute_query` accepts an optional `format` argument:
-
-- `"dict"` (default): rows are `[{col: value, ...}, ...]` — human-friendly.
-- `"compact"`: rows are `[[value, value, ...], ...]` aligned to
-  `columns`. On a 100-row × 10-column result this typically halves the
-  JSON payload, which matters for token-bound AI usage. Identical
-  semantics — just no repeated column names per row.
+See [`scripts/compare_release/README.md`](scripts/compare_release/README.md)
+for the manual `python compare.py …` invocation and the recommended
+staging-dump query.
 
 ---
 
@@ -380,25 +514,6 @@ full list. The minimum you need:
 | `MSSQL_MAX_ROWS` | `1000` | Row cap per query |
 | `MSSQL_QUERY_TIMEOUT` | `30` | Seconds |
 | `MSSQL_AUDIT_LOG_PATH` | `./logs/audit.jsonl` | Append-only, daily rotation |
-
----
-
-## Diagnostics
-
-```bash
-mssql-mcp-server doctor
-```
-
-Runs through: Python version → ODBC driver → config → audit log → Entra
-token → real connection → `SELECT 1`. Each check is `PASS` / `WARN` /
-`FAIL` / `INFO`, with a one-line `fix:` hint on failures.
-
-Flags:
-
-- `--skip-token` — skip the token acquisition step
-- `--skip-db` — driver + config only, no connection
-
-Exit 0 on full PASS, exit 1 on any FAIL. Scriptable in CI.
 
 ---
 
