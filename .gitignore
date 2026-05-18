@@ -57,8 +57,10 @@ logs/
 ~
 ~*
 
-# Claude Code session metadata
-.claude/
+# Claude Code session metadata (settings.local.json, projects/, history, worktrees, etc.)
+.claude/*
+# ...but DO track project-level Claude skills that should ship with the repo:
+!.claude/skills/
 
 # IDE
 .idea/

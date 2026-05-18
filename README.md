@@ -272,6 +272,34 @@ both servers concurrently and returns a unified diff. Examples:
 > entry tagged `added` / `removed` / `changed`, identical fields
 > omitted).
 
+### Release-file drift compare
+
+The `compare_*` MCP tools above work environment-to-environment. For
+the common case of comparing a **consolidated release SQL file** (the
+"desired state") against a live environment (the "current state"),
+the repo ships:
+
+| Asset | Purpose |
+|---|---|
+| `scripts/compare_release/compare.py` | Standalone read-only CLI: parses the file, ingests a staging-definition dump, and writes a clickable HTML drift report with the actual added / removed / changed SQL text per object. |
+| `.claude/skills/sql-compare/SKILL.md` | Claude Code skill — say *"compare X.sql with stg"* (or just *"compare"* with a file path in context) and Claude drives the whole workflow end-to-end. |
+
+What you get on disk:
+
+```
+build/drift/<timestamp>/
+├── index.html              ← summary table, click any DRIFT row
+├── <OBJECT>.html           ← per-object change blocks (real SQL + context)
+├── <OBJECT>.txt            ← plain-text equivalent (grep-friendly)
+└── report.json             ← machine-readable summary
+```
+
+The skill enforces hard rules: never DDL/DML, only objects in the file
+are reported, and chat output is kept to one screen — diffs go to disk,
+not into your context window. See
+[`scripts/compare_release/README.md`](scripts/compare_release/README.md)
+for the manual invocation.
+
 ### Compact response format
 
 `execute_query` accepts an optional `format` argument:
