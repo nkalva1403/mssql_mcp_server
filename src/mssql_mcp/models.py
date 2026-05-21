@@ -24,7 +24,7 @@ class QueryParam(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    name: str = Field(..., description="Label for logs. Bindings are positional.")
+    name: str | None = Field(default=None, description="Optional label for audit logs.")
     value: ParamValue = Field(..., description="Scalar value to bind.")
     sql_type: str = Field("auto", description="Type hint or 'auto'.")
 
@@ -43,8 +43,8 @@ class QueryResult(BaseModel):
     columns: list[str]
     rows: list[dict[str, Any]]
     row_count: int
-    truncated: bool = Field(..., description="True if the row cap was hit.")
-    duration_ms: int
+    truncated: bool
+    duration_ms: int | None = None
     format: Literal["dict"] = "dict"
 
 
@@ -60,8 +60,8 @@ class CompactQueryResult(BaseModel):
     columns: list[str]
     rows: list[list[Any]]
     row_count: int
-    truncated: bool = Field(..., description="True if the row cap was hit.")
-    duration_ms: int
+    truncated: bool
+    duration_ms: int | None = None
     format: Literal["compact"] = "compact"
 
 
@@ -71,7 +71,7 @@ class NonQueryResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     rows_affected: int
-    duration_ms: int
+    duration_ms: int | None = None
 
 
 class DdlResult(BaseModel):
@@ -80,7 +80,7 @@ class DdlResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     statement: str = Field(..., description="Leading DDL keyword (e.g. CREATE).")
-    duration_ms: int
+    duration_ms: int | None = None
 
 
 class ExplainResult(BaseModel):
@@ -104,7 +104,7 @@ class TableInfo(BaseModel):
     schema_name: Annotated[str, Field(alias="schema")]
     name: str
     type: TableKind
-    row_count_estimate: int = Field(..., description="Estimate from DMV (can lag).")
+    row_count_estimate: int
 
 
 class ColumnInfo(BaseModel):
@@ -147,9 +147,7 @@ class IndexInfo(BaseModel):
     key_columns: list[str]
     included_columns: list[str] = Field(default_factory=list)
     filter_definition: str | None = None
-    fragmentation_pct: float | None = Field(
-        default=None, description="From DMV; null if not granted."
-    )
+    fragmentation_pct: float | None = None
 
 
 ForeignKeyDirection = Literal["outgoing", "incoming"]
@@ -185,8 +183,8 @@ class ObjectInfo(BaseModel):
     schema_name: Annotated[str, Field(alias="schema")]
     name: str
     kind: ObjectKind
-    created: str | None = Field(default=None, description="ISO timestamp.")
-    modified: str | None = Field(default=None, description="ISO timestamp.")
+    created: str | None = None
+    modified: str | None = None
 
 
 class ObjectDefinition(BaseModel):
@@ -197,7 +195,7 @@ class ObjectDefinition(BaseModel):
     schema_name: Annotated[str, Field(alias="schema")]
     name: str
     kind: ObjectKind
-    definition: str = Field(..., description="CREATE ... source from sys.sql_modules.")
+    definition: str
     line_count: int
 
 
@@ -214,14 +212,12 @@ class ObjectDiff(BaseModel):
     schema_name: Annotated[str, Field(alias="schema")]
     name: str
     kind: ObjectKind
-    identical: bool = Field(..., description="True if source matches byte-for-byte.")
-    unified_diff: str = Field(
-        ..., description="Unified diff (env_a→env_b), empty when identical."
-    )
+    identical: bool
+    unified_diff: str
     a_line_count: int
     b_line_count: int
-    a_missing: bool = Field(default=False, description="Object doesn't exist in env_a.")
-    b_missing: bool = Field(default=False, description="Object doesn't exist in env_b.")
+    a_missing: bool = False
+    b_missing: bool = False
 
 
 class TableColumnDiff(BaseModel):
@@ -246,10 +242,7 @@ class TableDiff(BaseModel):
     name: str
     identical: bool
     column_diffs: list[TableColumnDiff] = Field(default_factory=list)
-    index_diffs: list[dict[str, Any]] = Field(
-        default_factory=list,
-        description="Indexes present in one env but not the other, or with different shape.",
-    )
+    index_diffs: list[dict[str, Any]] = Field(default_factory=list)
     foreign_key_diffs: list[dict[str, Any]] = Field(default_factory=list)
     a_missing: bool = False
     b_missing: bool = False
@@ -304,13 +297,13 @@ class ServerInfo(BaseModel):
     version: str
     edition: str | None = None
     database: str
-    user: str = Field(..., description="SUSER_SNAME() — Entra principal under Entra modes.")
+    user: str = Field(..., description="SUSER_SNAME(); Entra principal under Entra auth.")
     original_login: str | None = Field(
         default=None, description="ORIGINAL_LOGIN(); differs after EXECUTE AS."
     )
     server_collation: str | None = None
-    mode: ServerMode = Field(..., description="read_only / write / ddl.")
-    auth_mode: AuthModeName = Field(..., description="Active auth flow.")
+    mode: ServerMode
+    auth_mode: AuthModeName
     max_rows: int
     query_timeout_seconds: int
 
