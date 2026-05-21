@@ -102,8 +102,10 @@ def server_info(db: Database) -> ServerInfo:
     result = db.fetch(_SERVER_INFO_SQL)
     row: dict[str, Any] = result.rows[0] if result.rows else {}
     auth_mode: AuthModeName = db.settings.mssql_auth_mode
+    version_raw = str(row.get("version") or "")
+    version = version_raw.splitlines()[0].strip() if version_raw else ""
     return ServerInfo(
-        version=str(row.get("version") or ""),
+        version=version,
         edition=row.get("edition"),
         database=str(row.get("database") or db.settings.mssql_database),
         user=str(row.get("user") or ""),
