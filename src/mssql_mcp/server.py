@@ -68,20 +68,26 @@ def build_server(settings: Settings) -> tuple[FastMCP, DatabaseManager]:
         registry = EnvironmentRegistry.from_path(settings.mssql_environments_file)
     manager = DatabaseManager(settings, registry=registry)
 
+    _base_instructions = (
+        "Query a Microsoft SQL Server database. Always prefer parameterised "
+        "queries via the `params` argument over string-interpolated values. "
+        "Pass `format='compact'` to `execute_query` to halve token cost on "
+        "wide or many-row result sets."
+    )
+    _registry_instructions = (
+        " If multiple environments are configured, call `list_environments` "
+        "and `current_environment` before assuming which server you're "
+        "connected to; use `switch_environment` / `switch_database` to move. "
+        "Use the `compare_*` tools to diff objects across environments without "
+        "switching."
+    )
+    _instructions = _base_instructions + (
+        _registry_instructions if registry is not None else ""
+    )
+
     mcp = FastMCP(
         "mssql-mcp-server",
-        instructions=(
-            "Query a Microsoft SQL Server database. Always prefer "
-            "parameterised queries via the `params` argument over "
-            "string-interpolated values. If multiple environments are "
-            "configured, call `list_environments` and `current_environment` "
-            "before assuming which server you're talking to; use "
-            "`switch_environment` / `switch_database` to move. To compare "
-            "objects across servers without switching, use the `compare_*` "
-            "tools (procedure/function/view/table). For wide or many-row "
-            "result sets, pass `format='compact'` to `execute_query` to "
-            "halve the token cost."
-        ),
+        instructions=_instructions,
         host=settings.mcp_http_host,
         port=settings.mcp_http_port,
         log_level=settings.log_level.upper(),  # type: ignore[arg-type]
@@ -286,26 +292,20 @@ def build_server(settings: Settings) -> tuple[FastMCP, DatabaseManager]:
 
     # ----- query execution -------------------------------------------------
 
+    _default_format: ResponseFormat = settings.mssql_default_format
+
     @mcp.tool()
     def execute_query(
         sql: str,
         params: list[QueryParam] | None = None,
-        format: ResponseFormat = "dict",
+        format: ResponseFormat = _default_format,
     ) -> QueryResult | CompactQueryResult:
-        """Run a read-only T-SQL statement (SELECT or CTE-led SELECT).
+        """Run a read-only T-SQL SELECT (or CTE-led SELECT).
 
-        Prefer parameterised queries: pass each value as a ``QueryParam``
-        and use ``?`` placeholders in the SQL. Inlining values into the
-        SQL is allowed but discouraged.
-
-        ``format='compact'`` returns columnar rows
-        (``rows: list[list]``) instead of list-of-dicts — saves ~40-60%
-        of tokens on wide or many-row results. Use it whenever you just
-        need to read data; use the default ``'dict'`` when you need to
-        return to a human.
-
-        Results are capped at ``MAX_ROWS`` rows; when the cap is hit
-        ``truncated`` is set to True."""
+        Use ``?`` placeholders and the ``params`` list to bind values.
+        ``format='compact'`` returns columnar rows (~40-60% fewer tokens
+        on wide results). Results capped at ``MAX_ROWS``; ``truncated``
+        is set when the cap is hit."""
         return query_tools.execute_query(
             manager.current_db, sql, params, format=format
         )

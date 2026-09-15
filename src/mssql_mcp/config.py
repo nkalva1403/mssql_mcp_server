@@ -93,6 +93,13 @@ class Settings(BaseSettings):
     mssql_query_timeout: int = Field(default=30, gt=0)
     mssql_pool_size: int = Field(default=5, gt=0)
     mssql_max_affected_rows: int = Field(default=10_000, gt=0)
+    mssql_default_format: Literal["dict", "compact"] = Field(
+        default="dict",
+        description=(
+            "Default response format for execute_query. "
+            "Set to 'compact' to halve token cost on all queries globally."
+        ),
+    )
 
     # --- Logging / transport ------------------------------------------------
     mssql_audit_log_path: Path = Path("./logs/audit.jsonl")

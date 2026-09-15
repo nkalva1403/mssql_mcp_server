@@ -1,110 +1,86 @@
 # compare_release
 
-Compare a consolidated SQL release file against a live SQL Server
-environment. **Read-only.** Produces a clickable HTML drift report
-with per-object change blocks (added / only-in-staging / changed)
-and the actual SQL text on both sides.
+Compare two SQL sources and render the **locked comparison-report format**.
+**Read-only** — this tool never opens a database connection.
 
-Pairs with the [`sql-compare`](../../.claude/skills/sql-compare/SKILL.md)
-Claude skill in this repo — say "compare" in Claude Code and the
-skill drives this script end-to-end.
+Pairs with the [`sql-compare`](../../.claude/skills/sql-compare/SKILL.md) Claude
+skill — say "compare" in Claude Code and the skill drives this script end to end,
+including producing the database-side dumps through the MCP server.
 
-## What it does
+## Files
 
-1. **Parses the file** — finds every `CREATE [OR ALTER] PROCEDURE|FUNCTION|VIEW`
-   (and `ALTER PROCEDURE`) header. For objects defined twice in the file,
-   the **last** occurrence wins (release-script convention).
-2. **Loads the staging dump** — reads a JSON file the running MCP server
-   wrote when an `execute_query` result exceeded the inline cap. Each row
-   has `name` + `definition`.
-3. **Normalizes** both sides — strips `/* */` and `-- ` comments,
-   `[brackets]` around identifiers, collapses whitespace, lowercases.
-4. **Diffs** with `difflib.SequenceMatcher` against a *reformatted*
-   version (one T-SQL keyword per line) so the change blocks are
-   semantic, not whitespace noise.
-5. **Renders** per-object HTML pages, an index, plain-text equivalents,
-   and a machine-readable JSON summary.
+| File | Role |
+|---|---|
+| `report_format.py` | **The locked format (v1.0).** Design tokens, CSS, page components, and the difference engine. Single source of truth. |
+| `sources.py` | Loads one side of a comparison into `{OBJECT: definition}`. |
+| `compare.py` | The driver: classify both sides, build the report, write HTML/JSON. |
 
-## Manual usage
+## The three modes are one thing
 
-```powershell
-python compare.py `
-  --file "C:\path\to\Consolidated_DB_Scripts_*.sql" `
-  --staging-dump "C:\path\to\dump-from-mcp.txt" `
-  --out-dir "C:\path\to\report" `
-  --env-label "stg" `
-  --open
+A "side" is just a source, so the mode is only a choice of two sources:
+
+```bash
+# database vs database
+python compare.py --left dump:prod.json --right dump:stg.json \
+    --left-label prod --right-label stg --title "prod vs stg" --out report.html
+
+# database vs consolidated release file
+python compare.py --left dump:prod.json --right file:release.sql \
+    --left-label "Production now" --right-label "Release 26.09.02.00" \
+    --title "Release 26.09.02.00 vs Production" --out report.html
+
+# file vs file
+python compare.py --left file:old.sql --right file:new.sql \
+    --left-label "Previous" --right-label "Proposed" --title "A vs B" --out report.html
 ```
 
-Producing the staging dump (one-shot, from inside Claude Code or any
-MCP client):
+Source kinds:
 
-```sql
-SELECT o.name AS proc_name, m.definition AS def
-FROM sys.sql_modules m
-INNER JOIN sys.objects  o ON o.object_id = m.object_id
-INNER JOIN sys.schemas  s ON s.schema_id = o.schema_id
-WHERE s.name = 'dbo'
-  AND o.name IN ( <object names from the file> )
-ORDER BY o.name;
-```
+- `file:PATH` — consolidated release script; objects are parsed out of it,
+  last definition of an object wins.
+- `dump:PATH` — JSON definition dump from the MCP server (a database side).
+  Accepts the MCP autosave envelope or a plain `{"NAME": "definition"}` map.
+- `dir:PATH` — a folder of one-object-per-file `.sql` scripts.
 
-Call it via `mcp__mssql__execute_query` with `format='compact'`. When
-the response is too large to return inline, the MCP automatically
-writes it to a file under
-`~/.claude/projects/.../tool-results/` and returns the path in the
-error message — point `--staging-dump` at that file.
+A bare path works too: `.sql` is treated as `file:`, anything else as `dump:`.
 
-## Output layout
+**Convention:** left is the existing state, right is the proposed state, so
+"added" always means the right side introduces it.
 
-```
-<out-dir>/
-├── index.html               <- summary table, click any DRIFT row
-├── report.json              <- machine-readable summary
-├── <OBJECT>.html            <- per-object change blocks (one per drift)
-└── <OBJECT>.txt             <- plain-text equivalent (grep-friendly)
-```
+## Useful flags
 
-Every drift block shows:
+| Flag | Effect |
+|---|---|
+| `--standalone` | Emit a complete HTML document for opening locally. Omit when publishing as an Artifact — the host supplies `<!doctype>/<head>/<body>`. |
+| `--findings FILE.json` | A list of `[severity, where, title, body]`; severity `high`/`med`/`low`. Rendered as the "Things to check first" section. |
+| `--json FILE` | Machine-readable summary — read this instead of the HTML. |
+| `--show-identical` | Also render the body of objects that match exactly. |
+| `--open` | Open the report when finished. |
 
-- **Context (preceding lines, identical on both sides)** — so you can
-  locate the change inside the proc structure.
-- **Staging (current)** / **File (replacement)** — the actual SQL on
-  each side.
-- **Context (following lines, identical on both sides)**.
+## What the format decides for you
 
-## Status meanings
+SQL Server does not round-trip definition text faithfully, so three
+normalisations are built in and are **not** reported as differences:
 
-| Status         | Meaning                                                                  |
-|----------------|--------------------------------------------------------------------------|
-| MATCH          | File body is semantically identical to staging.                          |
-| DRIFT          | File would change staging. Look at the per-object HTML for what & why.   |
-| staging ahead  | Staging has audit-history dates the file doesn't — file may regress.    |
-| missing        | The object is in the file but does not exist in staging.                 |
+1. **`CREATE OR ALTER X` is stored as `CREATE    X`.** Both sides are
+   canonicalised, as are `PROC` / `PROCEDURE`.
+2. **Indentation and trailing whitespace are not preserved.** Lines that match
+   apart from spacing are counted separately as "spacing-only".
+3. **Blank lines are not preserved.** They are excluded from the comparison and
+   counted per object so the totals still reconcile. One production procedure
+   came back with 977 extra blank lines; without this rule its diff was
+   unreadable.
 
-## Why the multi-pass normalize?
+Object names match case-insensitively (as SQL Server does) but display in their
+original casing.
 
-T-SQL formatting varies wildly between editors and the storage form in
-`sys.sql_modules`. Comparing raw bytes would flag every proc as
-different because of `CREATE` vs `CREATE OR ALTER`, `[brackets]`,
-indentation, trailing `GO`s, etc. The aggressive `normalize()` (used
-for the MATCH/DIFFER decision) collapses ALL whitespace and unifies
-the prefix. The lighter `reformat()` (used only for the diff display)
-preserves enough structure that the change blocks are still readable.
+Every content line of every differing object is rendered — the report never
+samples or truncates.
 
-## Limitations
+## Changing the format
 
-- Tables aren't currently compared (the consolidated files we've seen
-  contain only `CREATE TABLE #temp` inside procs). Add a separate path
-  using `INFORMATION_SCHEMA.COLUMNS` if needed.
-- The "staging ahead" heuristic relies on audit-history dates in the
-  proc's header comment. If a team doesn't keep that convention, you'll
-  still see DRIFT but the directional hint won't be set.
-- Doesn't follow `EXEC` chains — each object is compared independently.
+Add a component to `report_format.py` and bump `FORMAT_VERSION`. Do not
+special-case rendering in `compare.py` or in a caller: the point of the lock is
+that every comparison, in every direction, produces the same document.
 
-## Token economy (when driven by Claude)
-
-The whole point of pairing this with a skill is keeping chat context
-small. The script writes everything to disk; Claude only reads back the
-JSON summary, never the diffs. Per-object HTML is opened in the user's
-browser — Claude doesn't need to render it.
+Tests: `pytest tests/test_compare_format.py`.
