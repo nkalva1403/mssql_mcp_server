@@ -1,159 +1,161 @@
 ---
 name: sql-compare
-description: Compare a consolidated SQL release file against a live SQL Server environment (procedures, functions, views) and produce a clickable HTML drift report with the actual changed SQL text. STRICTLY READ-ONLY. Use this skill when the user says "compare", "/compare", "/sql-compare", "drift", "release diff", "compare X.sql with stg/prod/dev", "check if file matches DB", "what would deploy", or pastes a path to a consolidated release SQL file and asks what changed. Also use when verifying whether staging has hotfixes the file is missing.
+description: Compare any two SQL sources - database to database, database to a consolidated release file, or file to file - and produce the locked-format HTML comparison report with full side-by-side diffs. STRICTLY READ-ONLY. Use when the user says "compare", "/compare", "/sql-compare", "drift", "release diff", "compare X.sql with stg/prod/dev", "compare prod and staging", "diff these two release files", "check if file matches DB", "what would deploy", or pastes a path to a release SQL file and asks what changed.
 ---
 
-# SQL release compare
+# SQL comparison reports
 
-When the user asks to compare a SQL release file against a database,
-drive the workflow below. Strictly read-only. Token-efficient by design:
-the heavy data stays on disk, the chat only sees a tiny summary and a
-link to the HTML report.
+Every comparison this repo produces uses **one locked format**, defined in
+`scripts/compare_release/report_format.py` (currently v1.0). The format was
+signed off after a full production comparison and must not be re-invented per
+run.
 
-## Inputs to resolve from the user
+## The format is locked - do not hand-roll HTML
 
-- **File** — a path to a `.sql` file (e.g. `Consolidated_DB_Scripts_*.sql`).
-  If the user pasted a path, use it; if not, ask once.
-- **Target environment** — name from `mcp__mssql__list_environments`
-  (`stg`, `prod`, `dev`, ...). If not stated, **ask one short question**
-  with the available env names as options. Do not guess.
-- **Schema** — defaults to `dbo`. If the file uses another schema, use that.
-- **Output directory** — pick a clean directory inside the project at
-  `<repo>/build/drift/<yyyymmdd-hhmm>/` or honor user override.
+**Never** write report HTML, CSS or diff markup yourself, and never ask another
+tool to render the comparison. Always go through the CLI:
 
-## Hard rules (must enforce)
+```
+python scripts/compare_release/compare.py --left <src> --right <src> --out <file.html>
+```
 
-1. **READ-ONLY.** Never run DDL or DML. Only `mcp__mssql__execute_query`
-   with `SELECT`, `mcp__mssql__get_object_definition`, `describe_table`,
-   `list_*`. Refuse anything else, even if asked.
-2. **Only objects in the file.** Don't enumerate or report on
-   staging-only objects. Extract the inventory from the file.
-3. **Token budget.** Don't paste proc bodies, audit history, or full
-   diffs into the chat. Everything lives on disk. The final assistant
-   message must fit in one screen: summary table + 1–3 critical findings
-   + path to the HTML.
-4. **Verify env before connecting.** Always call `current_environment`
-   and `server_info` after `switch_environment`; abort if `mode` is
-   not `read_only`.
+If a report needs something the format does not have, add a component to
+`report_format.py` and bump `FORMAT_VERSION` - do not special-case it in a
+caller. Changing colours, fonts, section order or the diff table is a format
+change, not a per-report decision.
+
+## The three modes are one thing
+
+A "side" is just a source. The mode is only a choice of two sources:
+
+| Comparison | `--left` | `--right` |
+|---|---|---|
+| database vs database | `dump:PROD.json` | `dump:STG.json` |
+| database vs release file | `dump:PROD.json` | `file:release.sql` |
+| file vs file | `file:old.sql` | `file:new.sql` |
+
+Source kinds: `file:` consolidated script (objects parsed out of it) ·
+`dump:` definition dump from the MCP (a database side) · `dir:` a folder of
+one-object-per-file `.sql`.
+
+Convention: **left is the existing/current state, right is the proposed state.**
+Keep it that way so "added" always means "the right side introduces this".
+
+## Hard rules
+
+1. **READ-ONLY.** Only `execute_query` with SELECT, `get_object_definition`,
+   `describe_table`, `list_*`. Never DDL or DML, even if asked. `compare.py`
+   itself never opens a connection.
+2. **Verify the environment before reading.** After `switch_environment`, call
+   `current_environment` and `server_info`, and confirm `mode` is `read_only`.
+   Abort if it is not.
+3. **Only objects in scope.** For a release comparison, take the object list
+   from the file. Do not enumerate the whole database.
+4. **Token discipline.** SQL bodies and diffs stay on disk. The chat gets the
+   summary counts, the findings, and the link. Never paste proc bodies or diff
+   hunks into the conversation.
 
 ## Steps
 
-### 1. Switch and verify env
+### 1. Resolve inputs
 
-```
-mcp__mssql__switch_environment(name=<env>, database=<db?>)
-mcp__mssql__current_environment()
-mcp__mssql__server_info()
-```
+Ask once, only for what is genuinely missing: the two sides, and a label for
+each (the labels appear as the column headings, e.g. "Production now" /
+"Release 26.09.02.00"). Default output directory
+`<repo>/build/compare/<yyyymmdd-hhmm>/`.
 
-Confirm `"mode":"read_only"`. If it isn't, stop and tell the user.
+### 2. For each database side, dump definitions
 
-### 2. Extract object inventory from the file
-
-Use the Grep tool against the file path:
-
-```
-pattern: ^\s*(?:CREATE\s+(?:OR\s+ALTER\s+)?|ALTER\s+)(?:PROCEDURE|PROC|FUNCTION|VIEW)\s+
-output_mode: content
--n: true
--i: true
-```
-
-Also catch split-line `CREATE\n OR ALTER PROCEDURE ...` — grep for
-`^\s*(?:OR\s+ALTER\s+)?(?:PROCEDURE|PROC|FUNCTION|VIEW)\s+`. Skip
-`CREATE TABLE` inside proc bodies (those are `#temp` tables).
-
-De-duplicate names (some appear twice in release scripts — both apply
-to the same target object). Build a final list of unique names.
-
-### 3. Dump current staging definitions in one shot
-
-Build one `execute_query` call with `format='compact'`:
+Switch and verify the environment, then one query per side:
 
 ```sql
 SELECT o.name AS proc_name, m.definition AS def
 FROM sys.sql_modules m
-INNER JOIN sys.objects  o ON o.object_id = m.object_id
-INNER JOIN sys.schemas  s ON s.schema_id = o.schema_id
-WHERE s.name = '<schema>'
-  AND o.name IN ( <comma-separated, quoted names from step 2> )
+JOIN sys.objects o ON o.object_id = m.object_id
+JOIN sys.schemas s ON s.schema_id = o.schema_id
+WHERE s.name = 'dbo'
+  AND o.name IN ( <names> )
 ORDER BY o.name;
 ```
 
-This will exceed the inline cap and the MCP will autosave the response.
-**Capture the file path from the error message** — that's the
-`--staging-dump` input for the next step.
+Use `format='compact'`. The MCP autosaves oversized responses - **capture the
+saved path from the message** and pass it as `dump:<path>`.
 
-### 4. Run the compare script
+If a definition has to come back through the conversation rather than an
+autosave file, pull it compressed and checksum it, so a transcription slip
+cannot reach the report silently:
 
-```
-python <repo-root>/scripts/compare_release/compare.py
-  --file <user-file>
-  --staging-dump <path-from-step-3>
-  --out-dir <out-dir-from-input-resolution>
-  --env-label <env-name>
-  --open
-```
-
-The script writes:
-
-- `<out-dir>/index.html` — summary table, clickable
-- `<out-dir>/<OBJECT>.html` — per-object change blocks (only for DRIFT)
-- `<out-dir>/<OBJECT>.txt` — plain-text equivalent
-- `<out-dir>/report.json` — machine-readable summary
-
-`--open` launches the index in the default browser.
-
-### 5. Read just the summary JSON
-
-```
-Read <out-dir>/report.json
+```sql
+SELECT CAST('' AS XML).value('xs:base64Binary(sql:column("t.z"))','varchar(max)') AS b64,
+       CONVERT(varchar(64), HASHBYTES('SHA2_256', CONVERT(varbinary(max), m.definition)), 2) AS sha
+FROM sys.sql_modules m
+JOIN sys.objects o ON o.object_id = m.object_id
+CROSS APPLY (SELECT COMPRESS(m.definition) AS z) t
+WHERE o.name = '<name>';
 ```
 
-Use its `summary` block (total / match / differs / missing /
-staging_ahead) and the `results[]` entries' `name` + `status` +
-(`added`, `removed`, `changed`, `dates_only_in_staging`).
+Decode with gzip, then confirm the SHA before writing the file. Return it in
+400-character chunks - long single lines get truncated in transit.
 
-### 6. Report — short
+### 3. Run the comparison
 
-Final assistant message must be **brief**:
+```
+python scripts/compare_release/compare.py \
+  --left  dump:<prod-dump.json>  --left-label  "Production now" \
+  --right file:<release.sql>     --right-label "Release 26.09.02.00" \
+  --title "Release 26.09.02.00 vs Production" \
+  --eyebrow "Database release comparison" \
+  --out <out-dir>/report.html --json <out-dir>/summary.json
+```
 
-- One-line headline (e.g. "21 objects compared: 6 match, 15 drift,
-  2 with staging ahead").
-- Tiny status table (proc name + status pill). No SQL inline.
-- The 1–3 most critical findings — typically the procs flagged
-  `staging ahead` (file would regress them) — mentioning each in a
-  single sentence, no code.
-- The HTML link: `Open <out-dir>/index.html`.
-- One pointer to where the deeper detail lives (`<obj>.html`).
+Add `--standalone` for a file the user opens locally; omit it when the HTML
+will be published as an Artifact (the host supplies the document scaffolding).
+`--findings` takes a JSON list of `[severity, where, title, body]`, severity
+being `high` / `med` / `low`.
 
-### 7. Forbidden in the chat output
+### 4. Read only the summary
 
-- Don't paste the SQL of any added/removed/changed block.
-- Don't quote audit-history comments.
-- Don't enumerate every drifted proc with a paragraph each.
-- Don't repeat what the HTML already shows.
+Read `<out-dir>/summary.json`. Use its `summary` counts and `objects[]`
+verdicts. Do not read the HTML back.
 
-## When the user asks follow-ups
+### 5. Report - short
 
-- **"What changed in proc X?"** → Read `<out-dir>/X.txt` and summarize
-  in ≤5 lines. Don't dump the whole file. If they want full detail,
-  point them at the HTML page or the `.txt` file.
-- **"Is staging ahead anywhere?"** → Look up
-  `results[*].staging_ahead` in `report.json`.
-- **"Re-run after editing the file"** → Repeat step 4 only (the dump
-  from step 3 is still valid unless the env changed).
+- One headline line with the counts.
+- The findings that need a decision, one sentence each.
+- The path or Artifact link.
+
+Do not restate what the report already shows.
+
+## What the format decides for you
+
+These are already handled - do not re-implement or "correct" them:
+
+- **`CREATE OR ALTER` is not a difference.** SQL Server stores it as
+  `CREATE    `. Both sides are canonicalised.
+- **Indentation and trailing whitespace are not differences.** They surface as
+  a separate "spacing-only" count.
+- **Blank lines are excluded** from the comparison and counted per object, so
+  totals still reconcile. One real procedure came back from production with 977
+  extra blank lines; without this rule its diff was unreadable.
+- **Object names match case-insensitively** but display in their original
+  casing.
+
+## Data and schema changes
+
+`compare.py` compares modules (procedures, functions, views). A consolidated
+release file usually also contains table/column/index DDL and data blocks, which
+have no "before" text to align. For those, verify each one live with a read-only
+query - does this already exist, has this already been applied - and pass the
+results in as `--findings`, or add a section through `report_format.Report`.
+Do not silently drop them from the report; an unmentioned block reads as
+"nothing to do".
 
 ## Edge cases
 
-- **Object in file but missing from staging** — status `MISSING`; flag
-  in the summary. The deploy would create the object.
-- **No drift at all** — say so and stop. Don't open a browser tab full
-  of green checkmarks; just confirm.
-- **Staging dump came back inline** (small enough to fit) — save the
-  inline JSON manually to a file, then pass to `--staging-dump`. This
-  rarely happens for real release scripts.
-- **`describe_table` for tables** — out of scope for this skill (the
-  script doesn't compare tables yet). If the user wants table compare,
-  open a follow-up: not all CREATE TABLEs in a release file are real
-  schema objects; many are local `#temp` tables.
+- **No differences at all** - say so and stop. Do not open a report full of
+  green rows.
+- **Object only on the left** - the right side would not create it. Reported
+  under "Only on the left".
+- **`CREATE TABLE` inside a procedure body** is a `#temp` table, not a schema
+  object. The file parser already ignores those.
+- **Both sides empty** - the script exits 2 rather than writing an empty report.
