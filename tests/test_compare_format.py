@@ -200,4 +200,97 @@ def test_html_in_object_text_is_escaped():
 
 
 def test_format_version_is_pinned():
-    assert fmt.FORMAT_VERSION == "1.0"
+    assert fmt.FORMAT_VERSION == "1.1"
+
+
+# --------------------------------------------------------------------------- #
+# Same-shape-before-comparing (v1.1) - the false-positive class reported by the
+# team: production stores a header split over several lines, under a leftover
+# release separator rule, while the release file has it on one line.
+# --------------------------------------------------------------------------- #
+
+PROD_SHAPE = (
+    "-" * 60 + "\n"
+    "\n"
+    "CREATE\n"
+    "\n"
+    "\n"
+    " PROCEDURE [dbo].[SP_X] (\n"
+    "\t@Id INT\n"
+    "\t)\n"
+    "AS\n"
+    "BEGIN\n"
+    "\tSELECT 1;\n"
+    "END"
+)
+
+FILE_SHAPE = (
+    "CREATE OR ALTER PROCEDURE [dbo].[SP_X] (\n"
+    "\t@Id INT\n"
+    "\t)\n"
+    "AS\n"
+    "BEGIN\n"
+    "\tSELECT 1;\n"
+    "END"
+)
+
+
+def test_split_header_and_separator_residue_are_not_differences():
+    rows, st = fmt.build_diff(PROD_SHAPE, FILE_SHAPE)
+    assert st.is_identical, (
+        f"formatting alone registered as a change: "
+        f"changed={st.changed} added={st.added} removed={st.removed}"
+    )
+
+
+def test_separator_residue_is_counted_not_silently_dropped():
+    _, st = fmt.build_diff(PROD_SHAPE, FILE_SHAPE)
+    assert st.left_preamble == 1
+    assert st.right_preamble == 0
+
+
+def test_merged_header_keeps_the_real_line_number():
+    rows, _ = fmt.build_diff(PROD_SHAPE, FILE_SHAPE)
+    kind, ln, lt, rn, rt = rows[0]
+    assert ln == 3, "left line number must point at the CREATE, not the merged text"
+    assert rn == 1
+    assert "PROCEDURE" in lt and "SP_X" in lt
+
+
+def test_a_real_header_change_is_still_reported():
+    changed = FILE_SHAPE.replace("@Id INT", "@Id BIGINT")
+    _, st = fmt.build_diff(PROD_SHAPE, changed)
+    assert not st.is_identical
+    assert st.changed == 1
+
+
+def test_a_renamed_object_is_still_reported():
+    renamed = FILE_SHAPE.replace("SP_X", "SP_Y")
+    _, st = fmt.build_diff(PROD_SHAPE, renamed)
+    assert not st.is_identical
+
+
+def test_real_comment_above_header_is_kept_when_not_residue():
+    """A separator rule is residue; a sentence is documentation - keep it."""
+    left = "-- owner: reporting team\nCREATE PROCEDURE [dbo].[SP_X]\nAS\nSELECT 1;"
+    right = "CREATE PROCEDURE [dbo].[SP_X]\nAS\nSELECT 1;"
+    _, st = fmt.build_diff(left, right)
+    assert st.left_preamble == 1, "comment lines above the header count as residue"
+    assert st.is_identical
+
+
+def test_text_without_a_module_header_is_left_alone():
+    left = "SELECT 1;\nSELECT 2;"
+    right = "SELECT 1;\nSELECT 3;"
+    rows, st = fmt.build_diff(left, right)
+    assert st.left_preamble == 0 and st.right_preamble == 0
+    assert st.changed == 1
+    assert [r[1] for r in rows] == [1, 2]
+
+
+def test_canonical_lines_merges_only_the_header():
+    lines, preamble = fmt.canonical_lines(PROD_SHAPE)
+    assert preamble == 1
+    assert lines[0][1].startswith("CREATE PROCEDURE [dbo].[SP_X]")
+    # the body lines keep their own identity and original numbering
+    assert [n for n, _, _ in lines[1:]] == [7, 8, 9, 10, 11, 12]

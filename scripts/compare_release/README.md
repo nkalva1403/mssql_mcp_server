@@ -57,19 +57,31 @@ A bare path works too: `.sql` is treated as `file:`, anything else as `dump:`.
 | `--show-identical` | Also render the body of objects that match exactly. |
 | `--open` | Open the report when finished. |
 
-## What the format decides for you
+## Same shape before comparing
 
-SQL Server does not round-trip definition text faithfully, so three
-normalisations are built in and are **not** reported as differences:
+SQL Server does not give a module back the way it was written. Both sides are
+put into the same shape first, so formatting alone never reads as a change.
+These are **not** reported as differences:
 
 1. **`CREATE OR ALTER X` is stored as `CREATE    X`.** Both sides are
    canonicalised, as are `PROC` / `PROCEDURE`.
-2. **Indentation and trailing whitespace are not preserved.** Lines that match
+2. **The header can come back split over several lines.** Production often
+   stores `CREATE`, blank lines, then ` PROCEDURE [dbo].[X] (` further down,
+   while the release file has one line. The header is merged into a single
+   entry on both sides, keeping the line number where the statement really
+   starts.
+3. **A separator rule stored above the header.** The dashed rule between blocks
+   in a release script often ends up inside the stored definition of the object
+   that followed it. Set aside and counted in the object's legend.
+4. **Indentation and trailing whitespace are not preserved.** Lines matching
    apart from spacing are counted separately as "spacing-only".
-3. **Blank lines are not preserved.** They are excluded from the comparison and
-   counted per object so the totals still reconcile. One production procedure
-   came back with 977 extra blank lines; without this rule its diff was
-   unreadable.
+5. **Blank lines are not preserved.** Excluded from the comparison and counted
+   per object so the totals still reconcile. One production procedure came back
+   with 977 extra blank lines; without this rule its diff was unreadable.
+
+Rules 2 and 3 were added in v1.1 after review feedback on the 26.09.02.00
+report: together they removed 8 false positives across 5 objects while leaving
+every real difference intact.
 
 Object names match case-insensitively (as SQL Server does) but display in their
 original casing.
