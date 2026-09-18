@@ -128,10 +128,21 @@ Do not restate what the report already shows.
 
 ## What the format decides for you
 
-These are already handled - do not re-implement or "correct" them:
+Both sides are put into the same shape before anything is compared, so
+formatting alone never reads as a change. These are already handled - do not
+re-implement or "correct" them:
 
 - **`CREATE OR ALTER` is not a difference.** SQL Server stores it as
-  `CREATE    `. Both sides are canonicalised.
+  `CREATE    `, and may store `PROC` as `PROCEDURE`. Canonicalised on both sides.
+- **A header split over several lines is not a difference.** Production often
+  returns `CREATE`, blank lines, then ` PROCEDURE [dbo].[X] (` on a later line,
+  while the release file has it on one. The header is merged into a single
+  entry on both sides, keeping the line number where the statement really
+  starts.
+- **A separator rule stored above the header is not a difference.** The dashed
+  rule between blocks in a release script frequently ends up inside the stored
+  definition of whatever object followed it. That residue is set aside and
+  counted in the object's legend.
 - **Indentation and trailing whitespace are not differences.** They surface as
   a separate "spacing-only" count.
 - **Blank lines are excluded** from the comparison and counted per object, so
@@ -139,6 +150,10 @@ These are already handled - do not re-implement or "correct" them:
   extra blank lines; without this rule its diff was unreadable.
 - **Object names match case-insensitively** but display in their original
   casing.
+
+Everything that survives those rules is a real difference. If a reviewer reports
+a false positive, fix it here as a shape rule and add a test - never by editing
+a generated report.
 
 ## Data and schema changes
 

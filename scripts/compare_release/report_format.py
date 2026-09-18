@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Locked comparison-report format (v1.0).
+"""Locked comparison-report format (v1.1).
 
 This module is the single source of truth for how SQL comparison reports look
 and how differences are decided. Every comparison mode - database to database,
@@ -9,13 +9,20 @@ output is identical in structure, colour and wording.
 Do not fork this file per comparison type. If a mode needs something new, add it
 here as a component and bump FORMAT_VERSION.
 
-Two decisions are baked in deliberately, because SQL Server does not round-trip
-text faithfully:
+SQL Server does not give a module back the way it was written, so both sides are
+put into the same shape first. Formatting alone must never read as a change:
 
-  * `CREATE OR ALTER X` is stored as `CREATE    X`. Both sides are canonicalised
-    so this never shows up as a difference.
-  * Blank lines are not preserved. They are excluded from the comparison and
-    counted separately, so the line totals still reconcile.
+  * `CREATE OR ALTER X` is stored as `CREATE    X`, and `PROC` may become
+    `PROCEDURE`. Canonicalised on both sides.
+  * The header itself can come back split over several lines with blanks in
+    between. It is merged into a single entry on both sides before aligning,
+    keeping the line number of where the statement really starts.
+  * A release script's separator rule often ends up stored above the header.
+    That residue is set aside and counted, not reported as a difference.
+  * Indentation, trailing space and blank lines are not preserved. Excluded from
+    the comparison and counted, so the line totals still reconcile.
+
+Everything that survives those rules is a real difference.
 
 Read-only by construction: nothing in here talks to a database.
 """
@@ -27,7 +34,7 @@ import html
 import re
 from dataclasses import dataclass, field
 
-FORMAT_VERSION = "1.0"
+FORMAT_VERSION = "1.1"
 
 E = html.escape
 
@@ -57,6 +64,73 @@ def content_lines(text: str) -> list[tuple[int, str]]:
     return [(i + 1, ln) for i, ln in enumerate(text.split("\n")) if ln.strip()]
 
 
+_MODULE_KIND = r"(?:PROCEDURE|PROC|FUNCTION|VIEW|TRIGGER)"
+_HEADER_STARTS = re.compile(r"^\s*(?:CREATE|ALTER)\b", re.IGNORECASE)
+_HEADER_COMPLETE = re.compile(
+    r"^\s*(?:CREATE|ALTER)\s+(?:OR\s+ALTER\s+)?" + _MODULE_KIND +
+    r"\s+(?:\[?\w+\]?\s*\.\s*)?\[?\w+\]?",
+    re.IGNORECASE,
+)
+_COMMENT_ONLY = re.compile(r"^\s*(?:--|/\*|\*/|\*)")
+_MAX_HEADER_LINES = 8
+
+
+def _is_noise_preamble(line: str) -> bool:
+    """Deployment residue that sits above the header: banner rules and comments.
+
+    A release script's separator line frequently ends up inside the stored
+    definition of whatever object followed it. It is not part of the module.
+    """
+    s = line.strip()
+    return bool(s) and (set(s) <= set("-=/*") or bool(_COMMENT_ONLY.match(line)))
+
+
+def canonical_lines(text: str) -> tuple[list[tuple[int, str, str]], int]:
+    """Put both sides into the same shape before they are compared.
+
+    Returns ([(original line number, text to display, comparison key)], preamble).
+
+    SQL Server does not store a module the way it was written. The same
+    procedure can come back with its header split over several lines with blanks
+    between them, and with a leftover separator rule above it. Comparing that
+    line-by-line against a release file - where the header is one line - reports
+    a difference that does not exist.
+
+    So the header is merged into a single entry on both sides, and deployment
+    residue above it is set aside and counted. The line number reported is where
+    the statement actually starts, so it still points into the real text.
+    """
+    raw = content_lines(text)
+    start = next((i for i, (_, ln) in enumerate(raw) if _HEADER_STARTS.match(ln)), None)
+    if start is None:
+        return [(n, ln, norm_key(ln)) for n, ln in raw], 0
+
+    out: list[tuple[int, str, str]] = []
+    preamble = 0
+    for n, ln in raw[:start]:
+        if _is_noise_preamble(ln):
+            preamble += 1
+        else:
+            out.append((n, ln, norm_key(ln)))
+
+    j = start
+    merged = raw[start][1].strip()
+    while not _HEADER_COMPLETE.match(merged) and j + 1 < len(raw) \
+            and (j - start) < _MAX_HEADER_LINES:
+        j += 1
+        merged = f"{merged} {raw[j][1].strip()}"
+
+    if _HEADER_COMPLETE.match(merged):
+        out.append((raw[start][0], merged, norm_key(merged)))
+    else:
+        # No recognisable module header - leave the lines exactly as they are.
+        j = start - 1
+
+    for n, ln in raw[j + 1:]:
+        out.append((n, ln, norm_key(ln)))
+    return out, preamble
+
+
 def logical_text(text: str) -> str:
     """Whitespace- and header-insensitive form of a whole object, for hashing."""
     return "\n".join(k for k in (norm_key(ln) for ln in text.split("\n")) if k)
@@ -80,6 +154,8 @@ class DiffStats:
     right_content: int = 0
     left_blank: int = 0
     right_blank: int = 0
+    left_preamble: int = 0
+    right_preamble: int = 0
 
     @property
     def is_identical(self) -> bool:
@@ -94,10 +170,12 @@ def build_diff(left_text: str, right_text: str) -> tuple[list[tuple], DiffStats]
     same | ws | chg | add | del. Every content line of both sides appears exactly
     once, so the rendered diff is complete.
     """
-    L = content_lines(left_text)
-    R = content_lines(right_text)
-    lk = [norm_key(t) for _, t in L]
-    rk = [norm_key(t) for _, t in R]
+    Lc, l_pre = canonical_lines(left_text)
+    Rc, r_pre = canonical_lines(right_text)
+    L = [(n, t) for n, t, _ in Lc]
+    R = [(n, t) for n, t, _ in Rc]
+    lk = [k for _, _, k in Lc]
+    rk = [k for _, _, k in Rc]
     sm = difflib.SequenceMatcher(None, lk, rk, autojunk=False)
 
     rows: list[tuple] = []
@@ -136,8 +214,9 @@ def build_diff(left_text: str, right_text: str) -> tuple[list[tuple], DiffStats]
     st.left_total = len(left_text.split("\n"))
     st.right_total = len(right_text.split("\n"))
     st.left_content, st.right_content = len(L), len(R)
-    st.left_blank = st.left_total - st.left_content
-    st.right_blank = st.right_total - st.right_content
+    st.left_preamble, st.right_preamble = l_pre, r_pre
+    st.left_blank = st.left_total - len(content_lines(left_text))
+    st.right_blank = st.right_total - len(content_lines(right_text))
     return rows, st
 
 
@@ -478,10 +557,17 @@ class Report:
             f'<span>{stats.left_content} &rarr; {stats.right_content} lines</span></span></summary>'
         )
         s.html.append('<div class="objbody">')
+        pre = ""
+        if stats.left_preamble or stats.right_preamble:
+            pre = (f" Deployment residue above the header (separator rules, banner "
+                   f"comments) set aside: {stats.left_preamble} on the left, "
+                   f"{stats.right_preamble} on the right.")
         s.html.append(
-            f'<div class="legend">Blank lines excluded from the comparison: '
-            f"{stats.left_blank} on the left, {stats.right_blank} on the right. "
-            f"Content lines compared: {stats.left_content} vs {stats.right_content}.</div>"
+            f'<div class="legend">Both sides are put into the same shape before '
+            f"comparing, so formatting alone never shows as a change. Blank lines "
+            f"excluded: {stats.left_blank} on the left, {stats.right_blank} on the "
+            f"right.{pre} Content lines compared: {stats.left_content} vs "
+            f"{stats.right_content}.</div>"
         )
         s.html.append(
             f'<div class="ctl"><label><input type="checkbox" id="hs-{E(anchor)}-{idx}" '
