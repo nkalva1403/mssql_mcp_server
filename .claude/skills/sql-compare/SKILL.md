@@ -19,6 +19,18 @@ tool to render the comparison. Always go through the CLI:
 python scripts/compare_release/compare.py --left <src> --right <src> --out <file.html>
 ```
 
+This applies to every comparison, in every project - not just work inside this
+repo. If the user asks to compare a file with a database, two databases, or two
+files anywhere at all, the answer is this CLI and this format.
+
+### Where the script lives
+
+Inside this repo, the path above is relative and works as written. **From any
+other project**, use the absolute path to the `mssql_mcp_server` checkout, e.g.
+`<checkout>/scripts/compare_release/compare.py`. The script is self-contained -
+it only needs `report_format.py` and `sources.py` beside it, and it never opens
+a database connection, so it runs fine from outside the repo.
+
 If a report needs something the format does not have, add a component to
 `report_format.py` and bump `FORMAT_VERSION` - do not special-case it in a
 caller. Changing colours, fonts, section order or the diff table is a format
