@@ -200,7 +200,7 @@ def test_html_in_object_text_is_escaped():
 
 
 def test_format_version_is_pinned():
-    assert fmt.FORMAT_VERSION == "1.1"
+    assert fmt.FORMAT_VERSION == "1.2"
 
 
 # --------------------------------------------------------------------------- #
@@ -294,3 +294,122 @@ def test_canonical_lines_merges_only_the_header():
     assert lines[0][1].startswith("CREATE PROCEDURE [dbo].[SP_X]")
     # the body lines keep their own identity and original numbering
     assert [n for n, _, _ in lines[1:]] == [7, 8, 9, 10, 11, 12]
+
+
+# --------------------------------------------------------------------------- #
+# Every statement is covered (v1.2) - DDL, data scripts, backups and checks are
+# compared batch by batch, and duplicates are reported, not collapsed.
+# --------------------------------------------------------------------------- #
+
+import compare  # noqa: E402
+from sources import classify_statement, find_statements, load_side  # noqa: E402
+
+RELEASE = """\
+-- banner
+GO
+SELECT * INTO UWDataStaging..TEMP_X_BACKUP FROM dbo.X
+GO
+IF COL_LENGTH('dbo.X', 'C') IS NULL
+  ALTER TABLE dbo.X ADD C INT NULL;
+GO
+CREATE OR ALTER PROCEDURE dbo.SP_A AS SELECT 1;
+GO
+-- a comment
+DELETE r FROM dbo.X r WHERE r.C = 1;
+GO
+"""
+
+
+def test_statements_are_found_and_modules_excluded():
+    stmts, comment_only = find_statements(RELEASE, "r.sql")
+    assert [s.kind for s in stmts] == ["SELECT INTO", "ALTER TABLE", "DELETE"]
+    assert comment_only == 1
+    assert stmts[0].line == 3
+
+
+def test_delete_alias_resolves_to_the_table():
+    kind, targets, _ = classify_statement("DELETE r FROM dbo.X r WHERE r.C = 1;")
+    assert (kind, targets) == ("DELETE", ["dbo.X"])
+
+
+def test_temp_tables_are_not_targets():
+    kind, targets, _ = classify_statement(
+        "SELECT * INTO #t FROM dbo.Y; DROP TABLE IF EXISTS #t;")
+    assert kind == "SELECT" and targets == ["dbo.Y"]
+
+
+@pytest.mark.parametrize("sql,kind", [
+    ("CREATE TABLE dbo.T (Id INT)", "CREATE TABLE"),
+    ("CREATE NONCLUSTERED INDEX IX ON dbo.T (Id)", "CREATE INDEX"),
+    ("ALTER FULLTEXT INDEX ON dbo.T SET STOPLIST = OFF", "FULLTEXT INDEX"),
+    ("INSERT INTO dbo.T VALUES (1)", "INSERT"),
+    ("UPDATE dbo.T SET Id = 2", "UPDATE"),
+    ("MERGE dbo.T AS t USING s ON 1=0 WHEN NOT MATCHED THEN INSERT VALUES (1);", "MERGE"),
+    ("DROP PROCEDURE IF EXISTS dbo.SP_OLD", "DROP MODULE"),
+    ("EXEC dbo.SP_X 1", "EXEC"),
+    ("PRINT 'hi'", "PRINT"),
+])
+def test_statement_kinds(sql, kind):
+    assert classify_statement(sql)[0] == kind
+
+
+def _stmts(text):
+    return find_statements(text, "x.sql")[0]
+
+
+def test_pairing_identical_changed_new_missing():
+    left = _stmts("UPDATE dbo.T SET A = 1 WHERE Id = 5;\nGO\n"
+                  "INSERT INTO dbo.Gone VALUES (1);\nGO\n")
+    right = _stmts("UPDATE dbo.T SET A = 2 WHERE Id = 5;\nGO\nALTER TABLE dbo.New ADD C INT;\nGO\n")
+    res = {r["verdict"]: r for r in compare.pair_statements(left, right)}
+    assert set(res) == {"changed", "new", "missing"}
+    assert res["changed"]["stats"].changed == 1
+
+
+def test_comment_only_change_is_reported_not_hidden():
+    left = _stmts("-- old note\nUPDATE dbo.T SET A = 1;\nGO\n")
+    right = _stmts("-- new note\nUPDATE dbo.T SET A = 1;\nGO\n")
+    (r,) = compare.pair_statements(left, right)
+    assert r["verdict"] == "changed" and r["comments_only"]
+
+
+def test_statement_diff_uses_real_file_line_numbers():
+    left = _stmts("\n\n\nUPDATE dbo.T SET A = 1;\nGO\n")
+    right = _stmts("UPDATE dbo.T SET A = 2;\nGO\n")
+    (r,) = compare.pair_statements(left, right)
+    assert r["rows"][0][1] == 4 and r["rows"][0][3] == 1
+
+
+def test_duplicate_module_and_statement_are_detected(tmp_path: Path):
+    f = tmp_path / "dup.sql"
+    f.write_text("CREATE PROCEDURE dbo.SP_A AS SELECT 1;\nGO\nUPDATE dbo.T SET A = 1;\nGO\n"
+                 "ALTER PROCEDURE dbo.SP_A AS SELECT 2;\nGO\n"
+                 "UPDATE dbo.T  SET A = 1; -- again\nGO\n",
+                 encoding="utf-8")
+    side = load_side(f"file:{f}")
+    assert side.duplicate_modules() == {"SP_A": [1, 5]}
+    assert len(side.duplicate_statements()) == 1
+    assert len(compare.duplicate_findings(side, "file")) == 2
+
+
+def test_dump_side_has_no_statements(tmp_path: Path):
+    d = tmp_path / "d.json"
+    d.write_text(json.dumps({"SP_A": "CREATE PROCEDURE dbo.SP_A AS SELECT 1;"}), encoding="utf-8")
+    assert load_side(f"dump:{d}").statements is None
+
+
+def test_cli_end_to_end_reports_statements(tmp_path: Path):
+    left, right = tmp_path / "l.sql", tmp_path / "r.sql"
+    left.write_text("ALTER TABLE dbo.X ADD C INT;\nGO\n", encoding="utf-8")
+    right.write_text(RELEASE, encoding="utf-8")
+    out, js = tmp_path / "r.html", tmp_path / "s.json"
+    import subprocess
+    subprocess.run([sys.executable, str(SCRIPTS / "compare.py"), "--left", f"file:{left}",
+                    "--right", f"file:{right}", "--out", str(out), "--json", str(js)],
+                   check=True, capture_output=True)
+    s = json.loads(js.read_text("utf-8"))
+    assert s["format_version"] == "1.2"
+    assert s["statement_summary"] == {"changed": 1, "identical": 0, "new": 2,
+                                      "missing": 0, "verify": 0}
+    html = out.read_text("utf-8")
+    assert "Every statement at a glance" in html and "Duplicates" in html

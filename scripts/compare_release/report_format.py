@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Locked comparison-report format (v1.1).
+"""Locked comparison-report format (v1.2).
 
 This module is the single source of truth for how SQL comparison reports look
 and how differences are decided. Every comparison mode - database to database,
@@ -24,6 +24,11 @@ put into the same shape first. Formatting alone must never read as a change:
 
 Everything that survives those rules is a real difference.
 
+Since v1.2 a report covers every statement in a script, not only modules: table
+DDL, indexes, data changes, backups and checks are aligned batch by batch and
+diffed with the same engine (`build_diff(..., module=False)`), and duplicates on
+either side are reported instead of being silently collapsed.
+
 Read-only by construction: nothing in here talks to a database.
 """
 from __future__ import annotations
@@ -34,7 +39,7 @@ import html
 import re
 from dataclasses import dataclass, field
 
-FORMAT_VERSION = "1.1"
+FORMAT_VERSION = "1.2"
 
 E = html.escape
 
@@ -162,16 +167,26 @@ class DiffStats:
         return self.changed == 0 and self.added == 0 and self.removed == 0
 
 
-def build_diff(left_text: str, right_text: str) -> tuple[list[tuple], DiffStats]:
+def build_diff(left_text: str, right_text: str,
+               module: bool = True) -> tuple[list[tuple], DiffStats]:
     """Align two object bodies line by line.
+
+    ``module=False`` is for statement batches (DDL, data scripts): they have no
+    stored form, so no header merging and no residue is set aside - every
+    content line, comments included, is compared.
 
     Returns (rows, stats). Each row is
     (kind, left_lineno, left_text, right_lineno, right_text) where kind is one of
     same | ws | chg | add | del. Every content line of both sides appears exactly
     once, so the rendered diff is complete.
     """
-    Lc, l_pre = canonical_lines(left_text)
-    Rc, r_pre = canonical_lines(right_text)
+    if module:
+        Lc, l_pre = canonical_lines(left_text)
+        Rc, r_pre = canonical_lines(right_text)
+    else:
+        Lc = [(n, ln, norm_key(ln)) for n, ln in content_lines(left_text)]
+        Rc = [(n, ln, norm_key(ln)) for n, ln in content_lines(right_text)]
+        l_pre = r_pre = 0
     L = [(n, t) for n, t, _ in Lc]
     R = [(n, t) for n, t, _ in Rc]
     lk = [k for _, _, k in Lc]
@@ -396,6 +411,8 @@ CHIP = {
     "pending": ("pend", "Not applied"),
     "applied": ("ok", "Applied"),
     "none": ("ok", "No change"),
+    "verify": ("pend", "Verify live"),
+    "duplicate": ("crit", "Duplicate"),
 }
 
 

@@ -1,12 +1,12 @@
 ---
 name: sql-compare
-description: Compare any two SQL sources - database to database, database to a consolidated release file, or file to file - and produce the locked-format HTML comparison report with full side-by-side diffs. STRICTLY READ-ONLY. Use when the user says "compare", "/compare", "/sql-compare", "drift", "release diff", "compare X.sql with stg/prod/dev", "compare prod and staging", "diff these two release files", "check if file matches DB", "what would deploy", or pastes a path to a release SQL file and asks what changed.
+description: Compare any two SQL sources - database to database, database to a consolidated release file, file to file, or a Confluence release folder to a consolidated file - and produce the locked-format HTML comparison report with full side-by-side diffs of EVERY statement (procedures/functions/views/triggers plus table DDL, indexes, data INSERT/UPDATE/DELETE/MERGE, backups, checks) and a duplicates check. STRICTLY READ-ONLY. Use when the user says "compare", "/compare", "/sql-compare", "drift", "release diff", "compare X.sql with stg/prod/dev", "compare prod and staging", "diff these two release files", "check if file matches DB", "compare the consolidated file with Confluence", "what would deploy", or pastes a path to a release SQL file and asks what changed.
 ---
 
 # SQL comparison reports
 
 Every comparison this repo produces uses **one locked format**, defined in
-`scripts/compare_release/report_format.py` (currently v1.0). The format was
+`scripts/compare_release/report_format.py` (currently v1.2). The format was
 signed off after a full production comparison and must not be re-invented per
 run.
 
@@ -52,6 +52,56 @@ one-object-per-file `.sql`.
 
 Convention: **left is the existing/current state, right is the proposed state.**
 Keep it that way so "added" always means "the right side introduces this".
+
+## Every statement is compared - not only procedures (v1.2)
+
+A compare covers **everything in the file**. `file:` and `dir:` sides are split
+on `GO` and every batch is accounted for:
+
+| What | How it is checked |
+|---|---|
+| Procedures, functions, views, triggers | Paired by name, diffed line by line (the module rules below) |
+| Table DDL (CREATE/ALTER/DROP/TRUNCATE TABLE, column adds) | Paired batch by batch, diffed line by line |
+| Indexes, full-text indexes, types, synonyms, sequences, schemas, DROP of modules, GRANT/REVOKE/DENY | Same |
+| Data scripts - INSERT, UPDATE, DELETE, MERGE | Same |
+| Backups (`SELECT ... INTO`), validation SELECTs, EXEC, PRINT | Same |
+| Comment-only batches (separator rules, banners) | Counted in "How this was verified", not listed |
+
+Statements are paired by identical code first (comments and spacing ignored),
+then by best similarity (at least 60%). Anything unpaired is **only on the
+left / only on the right**. The verdict always comes from the full line diff,
+so a changed comment is shown (flagged "comments only"), never hidden.
+
+**Duplicates are reported, not collapsed.** A module defined twice, or the same
+statement twice, on either side becomes a high-severity finding and a row in
+the "Duplicates" section. (The module diff still uses the last definition,
+which is what a deploy leaves behind.)
+
+**Database sides.** A database keeps no record of which data or schema scripts
+ran, so when one side is a `dump:` the file's statements are listed as
+**Verify live**. Verify each with a read-only query (does the column/index
+exist, are the rows there) and pass the results as `--findings`.
+
+## Confluence release folder vs consolidated file
+
+Releases are documented as a Confluence folder (e.g. `UW-CMS2-26.10.02.00`)
+with pages *Create/Alter Scripts*, *Data Insert/Update Scripts*,
+*SP/Functions Scripts*, *POST STAGING*, and *Consolidated Scripts* (holds
+attachments, not scripts). To compare that folder with a consolidated file:
+
+1. List the folder's children (`getConfluenceContentDescendants`), then read
+   each script page as **html** (`detail: full`). Markdown silently drops
+   macros, so a page can come back empty when it is not.
+2. Take every `<pre><code>` block in page order, with its expand title
+   (`<summary>`) as its label.
+3. **POST STAGING wins:** if an object or script appears on POST STAGING and on
+   an earlier page, keep only the POST STAGING copy.
+4. Write the kept blocks to one `.sql` file in this order: Create/Alter → Data
+   Insert/Update → SP/Functions → POST STAGING. Put each label in its own
+   comment-only batch (`-- [page] label` + `GO`) so the labels are not compared.
+5. Run `compare.py --left file:<that file> --right file:<consolidated.sql>`.
+   Expect backups and validation SELECTs the consolidation added to appear
+   **only on the right**, so every one is visible and accounted for.
 
 ## Hard rules
 
@@ -128,7 +178,8 @@ being `high` / `med` / `low`.
 ### 4. Read only the summary
 
 Read `<out-dir>/summary.json`. Use its `summary` counts and `objects[]`
-verdicts. Do not read the HTML back.
+verdicts, `statement_summary` and `statements[]` for everything else, and
+`duplicates[]`. Do not read the HTML back.
 
 ### 5. Report - short
 
@@ -169,18 +220,16 @@ a generated report.
 
 ## Data and schema changes
 
-`compare.py` compares modules (procedures, functions, views). A consolidated
-release file usually also contains table/column/index DDL and data blocks, which
-have no "before" text to align. For those, verify each one live with a read-only
-query - does this already exist, has this already been applied - and pass the
-results in as `--findings`, or add a section through `report_format.Report`.
-Do not silently drop them from the report; an unmentioned block reads as
-"nothing to do".
+Since v1.2 these are compared like everything else (see "Every statement is
+compared" above) - never hand-check them in chat instead of running the CLI.
+Against a database side they come out as **Verify live**: check each with a
+read-only query and pass the results in as `--findings`. Never drop one from
+the report; an unmentioned block reads as "nothing to do".
 
 ## Edge cases
 
-- **No differences at all** - say so and stop. Do not open a report full of
-  green rows.
+- **No differences at all** - say so in one line, and still produce the report:
+  it is the evidence the user files with the release.
 - **Object only on the left** - the right side would not create it. Reported
   under "Only on the left".
 - **`CREATE TABLE` inside a procedure body** is a `#temp` table, not a schema

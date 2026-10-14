@@ -11,8 +11,8 @@ including producing the database-side dumps through the MCP server.
 
 | File | Role |
 |---|---|
-| `report_format.py` | **The locked format (v1.0).** Design tokens, CSS, page components, and the difference engine. Single source of truth. |
-| `sources.py` | Loads one side of a comparison into `{OBJECT: definition}`. |
+| `report_format.py` | **The locked format (v1.2).** Design tokens, CSS, page components, and the difference engine. Single source of truth. |
+| `sources.py` | Loads one side of a comparison: its modules `{OBJECT: definition}`, every other statement batch, and where each module is defined (for duplicates). |
 | `compare.py` | The driver: classify both sides, build the report, write HTML/JSON. |
 
 ## The three modes are one thing
@@ -37,7 +37,7 @@ python compare.py --left file:old.sql --right file:new.sql \
 Source kinds:
 
 - `file:PATH` — consolidated release script; objects are parsed out of it,
-  last definition of an object wins.
+  last definition of an object wins (earlier ones are reported as duplicates).
 - `dump:PATH` — JSON definition dump from the MCP server (a database side).
   Accepts the MCP autosave envelope or a plain `{"NAME": "definition"}` map.
 - `dir:PATH` — a folder of one-object-per-file `.sql` scripts.
@@ -46,6 +46,28 @@ A bare path works too: `.sql` is treated as `file:`, anything else as `dump:`.
 
 **Convention:** left is the existing state, right is the proposed state, so
 "added" always means the right side introduces it.
+
+## Every statement, not only modules (v1.2)
+
+`file:` and `dir:` sides are split on `GO`, and every batch that is not a
+procedure/function/view/trigger is compared too: table DDL, indexes, full-text
+indexes, types, synonyms, permissions, INSERT/UPDATE/DELETE/MERGE, `SELECT ...
+INTO` backups, validation SELECTs, EXEC and PRINT. Each statement is labelled by
+its most significant action and target (`ALTER TABLE dbo.X`, `DELETE dbo.Y` -
+aliases like `DELETE r FROM dbo.Y r` are resolved; `#temp` tables are ignored).
+
+Pairing: identical code first (comments and spacing ignored), then the most
+similar remaining batch if at least 60% alike; the rest is only-left/only-right.
+The verdict comes from the full line diff, so a comment-only change is shown and
+flagged, not hidden. Statement diffs show real file line numbers.
+
+Duplicates - a module defined twice or the same statement twice on one side -
+are reported as high-severity findings and in their own section.
+
+A `dump:` side has no statements (a database does not record which scripts
+ran), so the file's statements are listed as **Verify live**.
+
+`summary.json` adds `statement_summary`, `statements[]` and `duplicates[]`.
 
 ## Useful flags
 
