@@ -36,18 +36,21 @@ from mssql_mcp.models import (
     ObjectKind,
     QueryParam,
     QueryResult,
+    ReleaseBatchResult,
     ResponseFormat,
     ServerInfo,
     TableDescription,
     TableDiff,
     TableInfo,
 )
+from mssql_mcp.release import resolve_release_targets
 from mssql_mcp.tools import compare as compare_tools
 from mssql_mcp.tools import diagnostics as diagnostics_tools
 from mssql_mcp.tools import environments as env_tools
 from mssql_mcp.tools import indexes as indexes_tools
 from mssql_mcp.tools import objects as objects_tools
 from mssql_mcp.tools import query as query_tools
+from mssql_mcp.tools import release as release_tools
 from mssql_mcp.tools import schema as schema_tools
 
 _LOG = logging.getLogger(__name__)
@@ -67,6 +70,9 @@ def build_server(settings: Settings) -> tuple[FastMCP, DatabaseManager]:
     if settings.mssql_environments_file is not None:
         registry = EnvironmentRegistry.from_path(settings.mssql_environments_file)
     manager = DatabaseManager(settings, registry=registry)
+    release_targets = resolve_release_targets(
+        settings.mssql_release_environments, registry
+    )
 
     _base_instructions = (
         "Query a Microsoft SQL Server database. Always prefer parameterised "
@@ -354,6 +360,41 @@ def build_server(settings: Settings) -> tuple[FastMCP, DatabaseManager]:
             changes from an LLM-driven workflow are inherently risky."""
             return query_tools.execute_ddl(manager.current_db, sql)
 
+    # ----- release batches (only when MSSQL_RELEASE_ENVIRONMENTS is set) ----
+
+    if release_targets:
+
+        @mcp.tool()
+        def run_release_batch(
+            environment: str,
+            sql: str | None = None,
+            batch_file: str | None = None,
+            label: str | None = None,
+            session_settings: list[str] | None = None,
+            timeout_seconds: int | None = None,
+            run_id: str | None = None,
+        ) -> ReleaseBatchResult:
+            """Run ONE GO-separated batch of a reviewed release script.
+
+            ``environment`` must be an allow-listed release target; the
+            batch always runs in that environment's default database on a
+            fresh autocommit connection. Pass the batch as ``sql`` (without
+            its GO line) or as ``batch_file``, a .sql file under the
+            configured release batch root (preferred: no retyping). With
+            ``run_id`` the full result is appended to that run's journal.
+            The first error stops the batch and is returned with its
+            number, severity, line and message; an open transaction is
+            rolled back. ``session_settings`` carries earlier SET-only
+            batches (e.g. ``SET QUOTED_IDENTIFIER ON``) so they apply as
+            they would in SSMS. Returns ``status='blocked'`` without
+            touching the database when a guard refuses the batch."""
+            return release_tools.run_release_batch(
+                manager, release_targets, environment, sql,
+                batch_file=batch_file, label=label,
+                session_settings=session_settings,
+                timeout_seconds=timeout_seconds, run_id=run_id,
+            )
+
     # ----- startup logging -------------------------------------------------
 
     _LOG.info(
@@ -368,6 +409,13 @@ def build_server(settings: Settings) -> tuple[FastMCP, DatabaseManager]:
             len(registry.environments),
             registry.default,
             manager.current_env_name,
+        )
+    if release_targets:
+        _LOG.warning(
+            "run_release_batch ENABLED for: %s",
+            ", ".join(
+                f"{n} ({e.default_database})" for n, e in release_targets.items()
+            ),
         )
     _LOG.info(
         "Mode: %s | Max rows: %d | Query timeout: %ds | Audit: %s",

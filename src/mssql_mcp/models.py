@@ -308,6 +308,37 @@ class ServerInfo(BaseModel):
     query_timeout_seconds: int
 
 
+# --- Release batches ------------------------------------------------------
+
+
+class ReleaseBatchResult(BaseModel):
+    """Result of :func:`run_release_batch` (one GO-separated batch)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["succeeded", "failed", "blocked"]
+    environment: str
+    database: str
+    label: str | None = None
+    run_id: str | None = None
+    batch_file: str | None = None
+    started_at: str = Field(..., description="UTC ISO timestamp.")
+    duration_ms: int
+    sql_sha256: str = Field(..., description="Hash of the batch (line endings normalised).")
+    rows_affected: list[int] = Field(
+        default_factory=list, description="Row count of each statement that reported one."
+    )
+    result_sets_returned: int = 0
+    messages: list[str] = Field(default_factory=list, description="PRINT / info messages.")
+    error_number: int | None = None
+    error_severity: int | None = None
+    error_state: int | None = None
+    error_line: int | None = Field(default=None, description="Line within the batch.")
+    error_procedure: str | None = None
+    error_message: str | None = None
+    transaction_rolled_back: bool = False
+
+
 # --- Helpers --------------------------------------------------------------
 
 
