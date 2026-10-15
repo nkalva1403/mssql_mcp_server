@@ -93,6 +93,14 @@ class Settings(BaseSettings):
     mssql_query_timeout: int = Field(default=30, gt=0)
     mssql_pool_size: int = Field(default=5, gt=0)
     mssql_max_affected_rows: int = Field(default=10_000, gt=0)
+    # Comma-separated environment names that run_release_batch may target.
+    # Empty = the tool is not registered. Independent of MSSQL_READ_ONLY.
+    mssql_release_environments: str | None = None
+    mssql_release_timeout: int = Field(default=600, gt=0, le=3600)
+    # Folder run_release_batch may read ``batch_file`` from (unset = sql only).
+    mssql_release_batch_root: Path | None = None
+    # Where per-run JSONL journals go (unset = <audit log dir>/release-journal).
+    mssql_release_journal_dir: Path | None = None
     mssql_default_format: Literal["dict", "compact"] = Field(
         default="dict",
         description=(
@@ -120,6 +128,8 @@ class Settings(BaseSettings):
         "mssql_audit_log_path",
         "azure_client_certificate_path",
         "mssql_environments_file",
+        "mssql_release_batch_root",
+        "mssql_release_journal_dir",
         mode="before",
     )
     @classmethod
